@@ -98,6 +98,19 @@ const virtualBottomSpacerPx = computed(() => {
   return Math.max(0, virtualTotalHeight.value - (txtParaOffsets[virtualEndIdx.value] || 0))
 })
 
+// Active TOC entry for TXT: the last heading at or before the current reading offset.
+// (Matching by id instead of label avoids highlighting several entries with the same title.)
+const currentTocId = computed<string | undefined>(() => {
+  if (currentBook.value?.format !== 'txt') return undefined
+  const offset = parseOffsetLocator(currentLocator.value)
+  let activeId: string | undefined
+  for (const item of tocItems.value) {
+    if (parseOffsetLocator(item.href) <= offset) activeId = item.id
+    else break
+  }
+  return activeId
+})
+
 const isCurrentPositionBookmarked = computed(() =>
   bookBookmarks.value.some((b) => b.locator === currentLocator.value)
 )
@@ -163,15 +176,25 @@ function recalculateTxtVirtualMetrics() {
 // real layout and the viewport jumps (typically back toward the top) while wheel-scrolling.
 let txtParaHeights = new Float64Array(0)
 let isMeasuringTxt = false
+// True while scrollToTxtOffset() is positioning the viewport; measurement must not
+// re-anchor the scroll position against the stale (pre-jump) scrollTop in that case.
+let txtNavigating = false
 
-async function measureRenderedParagraphs() {
-  if (isMeasuringTxt) return
+async function waitMeasureIdle() {
+  while (isMeasuringTxt) {
+    await nextTick()
+  }
+}
+
+// Returns true when any paragraph height was corrected (i.e. offsets changed).
+async function measureRenderedParagraphs(): Promise<boolean> {
+  if (isMeasuringTxt) return false
   const container = txtScrollContainerRef.value
   const n = txtParagraphs.value.length
-  if (!container || n === 0 || txtParaHeights.length !== n) return
+  if (!container || n === 0 || txtParaHeights.length !== n) return false
   const start = virtualStartIdx.value
   const end = virtualEndIdx.value
-  if (end - start < 2) return
+  if (end - start < 2) return false
 
   isMeasuringTxt = true
   try {
@@ -196,7 +219,7 @@ async function measureRenderedParagraphs() {
       prevTop = top
       prevIdx = i
     }
-    if (!changed) return
+    if (!changed) return false
 
     const oldOffsets = txtParaOffsets
     const scrollTop = container.scrollTop
@@ -216,9 +239,10 @@ async function measureRenderedParagraphs() {
     virtualMetricsVersion.value++
 
     await nextTick()
-    if (scrollTop > 0) {
+    if (scrollTop > 0 && !txtNavigating) {
       container.scrollTop = Math.round(offsets[anchor] + anchorDelta)
     }
+    return true
   } finally {
     isMeasuringTxt = false
   }
@@ -421,15 +445,31 @@ async function scrollToTxtOffset(offset: number) {
     recalculateTxtVirtualMetrics()
   }
   const targetIdx = findParaIndexByOffset(offset)
-  const targetY = txtParaOffsets[targetIdx] || 0
-  virtualStartIdx.value = Math.max(0, targetIdx - VIRTUAL_OVERSCAN)
-  virtualEndIdx.value = Math.min(n, targetIdx + VIRTUAL_OVERSCAN + 25)
 
-  await nextTick()
-  const container = txtScrollContainerRef.value
-  if (!container) return
-  container.scrollTop = Math.round(targetY)
-  updateVirtualWindow(container.scrollTop, true)
+  // Paragraph offsets above the target are estimates until the paragraphs around it have
+  // been rendered and measured. Render the target window, measure, then position using the
+  // corrected offsets (repeat until stable) so the jump lands on the intended paragraph.
+  txtNavigating = true
+  try {
+    for (let pass = 0; pass < 4; pass++) {
+      virtualStartIdx.value = Math.max(0, targetIdx - VIRTUAL_OVERSCAN)
+      virtualEndIdx.value = Math.min(n, targetIdx + VIRTUAL_OVERSCAN + 25)
+
+      await nextTick()
+      await waitMeasureIdle()
+      const container = txtScrollContainerRef.value
+      if (!container) return
+      const changed = await measureRenderedParagraphs()
+      container.scrollTop = Math.round(txtParaOffsets[targetIdx] || 0)
+      if (!changed) break
+    }
+    const container = txtScrollContainerRef.value
+    if (container) {
+      updateVirtualWindow(container.scrollTop, true)
+    }
+  } finally {
+    txtNavigating = false
+  }
 }
 
 function handleTxtScroll() {
@@ -1055,6 +1095,7 @@ onBeforeUnmount(() => {
       :search-results="searchResults"
       :is-searching="isSearching"
       :current-chapter="currentChapterTitle"
+      :current-toc-id="currentTocId"
       @close="drawerOpen = false"
       @update:active-tab="drawerTab = $event"
       @select-toc="handleSelectToc"

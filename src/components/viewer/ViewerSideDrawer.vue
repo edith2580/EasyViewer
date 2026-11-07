@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { nextTick, ref, watch } from 'vue'
 import type { BookmarkItem, SearchResultItem, TocItem } from '@/types'
 import {
   ListTree,
@@ -22,6 +22,7 @@ const props = defineProps<{
   searchResults: SearchResultItem[]
   isSearching: boolean
   currentChapter?: string
+  currentTocId?: string
 }>()
 
 const emit = defineEmits<{
@@ -51,6 +52,30 @@ watch(
       }, 60)
     }
   }
+)
+
+function isActiveToc(item: TocItem): boolean {
+  if (props.currentTocId) return item.id === props.currentTocId
+  return !!props.currentChapter && props.currentChapter === item.label
+}
+
+// Scroll the TOC list so the current chapter is visible (centered) when the drawer
+// opens or the TOC tab is shown.
+function scrollToActiveToc() {
+  nextTick(() => {
+    requestAnimationFrame(() => {
+      const el = document.querySelector('[data-toc-active="true"]') as HTMLElement | null
+      el?.scrollIntoView({ block: 'center' })
+    })
+  })
+}
+
+watch(
+  () => [props.open, props.activeTab] as const,
+  ([isOpen, tab]) => {
+    if (isOpen && tab === 'toc') scrollToActiveToc()
+  },
+  { immediate: true }
 )
 
 function formatDate(ts: number): string {
@@ -147,8 +172,9 @@ function formatDate(ts: number): string {
           <button
             type="button"
             class="w-full flex items-center justify-between text-left px-3 py-2.5 rounded-xl text-sm transition-colors hover:bg-indigo-500/10"
+            :data-toc-active="isActiveToc(item) ? 'true' : 'false'"
             :class="
-              currentChapter === item.label
+              isActiveToc(item)
                 ? 'bg-indigo-500/15 text-indigo-600 dark:text-indigo-400 font-semibold'
                 : ''
             "

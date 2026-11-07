@@ -1,6 +1,6 @@
 [package]
 name = "easy-viewer"
-version = "0.1.1"
+version = "0.1.2"
 description = "심플한 Text, EPUB 범용 문서 뷰어"
 authors = ["EasyViewer Team"]
 edition = "2021"
