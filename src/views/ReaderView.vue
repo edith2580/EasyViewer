@@ -77,6 +77,9 @@ const viewportSize = ref({ width: 900, height: 680 })
 // Virtual Scroll state for TXT vertical scroll mode
 const VIRTUAL_OVERSCAN = 35
 let txtParaOffsets = new Float64Array(1)
+// Reactive version counter: txtParaOffsets is a plain typed array, so computeds that
+// read it must depend on this counter to be recomputed after a layout change (e.g. resize).
+const virtualMetricsVersion = ref(0)
 const virtualTotalHeight = ref(0)
 const virtualStartIdx = ref(0)
 const virtualEndIdx = ref(80)
@@ -85,11 +88,15 @@ const virtualVisibleParagraphs = computed(() =>
   txtParagraphs.value.slice(virtualStartIdx.value, virtualEndIdx.value)
 )
 
-const virtualTopSpacerPx = computed(() => txtParaOffsets[virtualStartIdx.value] || 0)
+const virtualTopSpacerPx = computed(() => {
+  void virtualMetricsVersion.value
+  return txtParaOffsets[virtualStartIdx.value] || 0
+})
 
-const virtualBottomSpacerPx = computed(() =>
-  Math.max(0, virtualTotalHeight.value - (txtParaOffsets[virtualEndIdx.value] || 0))
-)
+const virtualBottomSpacerPx = computed(() => {
+  void virtualMetricsVersion.value
+  return Math.max(0, virtualTotalHeight.value - (txtParaOffsets[virtualEndIdx.value] || 0))
+})
 
 const isCurrentPositionBookmarked = computed(() =>
   bookBookmarks.value.some((b) => b.locator === currentLocator.value)
@@ -121,6 +128,7 @@ function recalculateTxtVirtualMetrics() {
     virtualTotalHeight.value = 0
     virtualStartIdx.value = 0
     virtualEndIdx.value = 0
+    virtualMetricsVersion.value++
     return
   }
 
@@ -143,6 +151,7 @@ function recalculateTxtVirtualMetrics() {
   offsets[n] = y
   txtParaOffsets = offsets
   virtualTotalHeight.value = y
+  virtualMetricsVersion.value++
 }
 
 function findParaIndexAtY(y: number): number {
@@ -824,6 +833,7 @@ onBeforeUnmount(() => {
           v-if="settingsStore.settings.viewMode === 'scroll'"
           ref="txtScrollContainerRef"
           class="flex-1 overflow-y-auto"
+          style="overflow-anchor: none"
           @scroll.passive="handleTxtScroll"
         >
           <article
