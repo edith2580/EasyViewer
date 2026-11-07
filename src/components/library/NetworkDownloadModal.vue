@@ -397,10 +397,14 @@ function formatItemDate(rawDate?: string): string {
 <template>
   <div
     v-if="open"
-    class="fixed inset-0 z-50 w-screen h-screen flex flex-col overflow-hidden"
+    class="fixed inset-0 z-50 w-full h-full flex flex-col overflow-hidden"
     :style="{
       backgroundColor: 'var(--ev-bg)',
-      color: 'var(--ev-text)'
+      color: 'var(--ev-text)',
+      paddingTop: 'env(safe-area-inset-top, 0px)',
+      paddingBottom: 'env(safe-area-inset-bottom, 0px)',
+      paddingLeft: 'env(safe-area-inset-left, 0px)',
+      paddingRight: 'env(safe-area-inset-right, 0px)'
     }"
   >
     <!-- ========================================================================= -->

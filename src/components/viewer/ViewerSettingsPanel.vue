@@ -24,8 +24,8 @@ const emit = defineEmits<{
 const settingsStore = useSettingsStore()
 
 const viewModes: Array<{ value: ViewMode; label: string }> = [
-  { value: 'paginated', label: '가로 페이지 넘김' },
-  { value: 'scroll', label: '세로 스크롤' }
+  { value: 'scroll', label: '세로 스크롤' },
+  { value: 'paginated', label: '가로 페이지 넘김' }
 ]
 
 const themes: Array<{ value: ThemeMode; label: string; bgClass: string }> = [

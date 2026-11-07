@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useBookStore } from '@/stores/useBookStore'
 import { useSettingsStore } from '@/stores/useSettingsStore'
@@ -64,15 +64,32 @@ const highlightedParaIndex = ref<number | null>(null)
 const epubContainerRef = ref<HTMLElement | null>(null)
 let epubEngine: EpubViewerEngine | null = null
 
-// TXT Engine state
+// TXT Engine state (shallowRef avoids creating 50,000+ Vue reactive proxies)
 const txtEncoding = ref('UTF-8')
-const txtParagraphs = ref<TxtParagraph[]>([])
+const txtParagraphs = shallowRef<TxtParagraph[]>([])
 const txtTotalLength = ref(1)
 const txtScrollContainerRef = ref<HTMLElement | null>(null)
 const txtPaginatedViewportRef = ref<HTMLElement | null>(null)
-const txtPages = ref<TxtPage[]>([])
+const txtPages = shallowRef<TxtPage[]>([])
 const txtCurrentPageIdx = ref(0)
 const viewportSize = ref({ width: 900, height: 680 })
+
+// Virtual Scroll state for TXT vertical scroll mode
+const VIRTUAL_OVERSCAN = 35
+let txtParaOffsets = new Float64Array(1)
+const virtualTotalHeight = ref(0)
+const virtualStartIdx = ref(0)
+const virtualEndIdx = ref(80)
+
+const virtualVisibleParagraphs = computed(() =>
+  txtParagraphs.value.slice(virtualStartIdx.value, virtualEndIdx.value)
+)
+
+const virtualTopSpacerPx = computed(() => txtParaOffsets[virtualStartIdx.value] || 0)
+
+const virtualBottomSpacerPx = computed(() =>
+  Math.max(0, virtualTotalHeight.value - (txtParaOffsets[virtualEndIdx.value] || 0))
+)
 
 const isCurrentPositionBookmarked = computed(() =>
   bookBookmarks.value.some((b) => b.locator === currentLocator.value)
@@ -93,6 +110,97 @@ function showToast(msg: string) {
   setTimeout(() => {
     if (toastMsg.value === msg) toastMsg.value = ''
   }, 2600)
+}
+
+function recalculateTxtVirtualMetrics() {
+  const paras = txtParagraphs.value
+  const n = paras.length
+  const offsets = new Float64Array(n + 1)
+  if (n === 0) {
+    txtParaOffsets = offsets
+    virtualTotalHeight.value = 0
+    virtualStartIdx.value = 0
+    virtualEndIdx.value = 0
+    return
+  }
+
+  const maxArticleWidth = Math.min(viewportSize.value.width || 880, 896)
+  const usableWidth = Math.max(200, maxArticleWidth - settingsStore.settings.pageMargin * 2)
+  const fontSize = settingsStore.settings.fontSize
+  const lineHeight = settingsStore.settings.lineHeight
+  const linePx = fontSize * lineHeight
+  const charsPerLine = Math.max(12, Math.floor(usableWidth / (fontSize * 0.92)))
+
+  let y = 0
+  for (let i = 0; i < n; i++) {
+    offsets[i] = y
+    const p = paras[i]
+    const len = p.text.length
+    const lines = len === 0 ? 1 : Math.ceil(len / charsPerLine)
+    const headingExtra = p.isHeading ? 36 : 0
+    y += lines * linePx + 12 + headingExtra
+  }
+  offsets[n] = y
+  txtParaOffsets = offsets
+  virtualTotalHeight.value = y
+}
+
+function findParaIndexAtY(y: number): number {
+  const n = txtParagraphs.value.length
+  if (n <= 1 || y <= 0) return 0
+  let low = 0
+  let high = n - 1
+  while (low < high) {
+    const mid = (low + high + 1) >>> 1
+    if (txtParaOffsets[mid] <= y) {
+      low = mid
+    } else {
+      high = mid - 1
+    }
+  }
+  return low
+}
+
+function findParaIndexByOffset(charOffset: number): number {
+  const paras = txtParagraphs.value
+  const n = paras.length
+  if (n <= 1 || charOffset <= 0) return 0
+  let low = 0
+  let high = n - 1
+  while (low < high) {
+    const mid = (low + high + 1) >>> 1
+    if (paras[mid].startOffset <= charOffset) {
+      low = mid
+    } else {
+      high = mid - 1
+    }
+  }
+  return low
+}
+
+function updateVirtualWindow(scrollTop: number, force = false) {
+  const n = txtParagraphs.value.length
+  if (n === 0) {
+    virtualStartIdx.value = 0
+    virtualEndIdx.value = 0
+    return
+  }
+  const viewH = viewportSize.value.height || 700
+  const firstVisible = findParaIndexAtY(scrollTop)
+  const lastVisible = findParaIndexAtY(scrollTop + viewH)
+  const nextStart = Math.max(0, firstVisible - VIRTUAL_OVERSCAN)
+  const nextEnd = Math.min(n, lastVisible + VIRTUAL_OVERSCAN + 1)
+
+  if (
+    force ||
+    Math.abs(nextStart - virtualStartIdx.value) >= 8 ||
+    Math.abs(nextEnd - virtualEndIdx.value) >= 8 ||
+    firstVisible < virtualStartIdx.value + 5 ||
+    lastVisible > virtualEndIdx.value - 5
+  ) {
+    virtualStartIdx.value = nextStart
+    virtualEndIdx.value = nextEnd
+  }
 }
 
 async function loadDocument() {
@@ -158,10 +266,13 @@ async function loadDocument() {
 
     await nextTick()
     updateViewportMeasurements()
-    recalculateTxtPages(parseOffsetLocator(initialLocator))
+    const targetOffset = parseOffsetLocator(initialLocator)
 
     if (settingsStore.settings.viewMode === 'scroll') {
-      await scrollToTxtOffset(parseOffsetLocator(initialLocator))
+      recalculateTxtVirtualMetrics()
+      await scrollToTxtOffset(targetOffset)
+    } else {
+      recalculateTxtPages(targetOffset)
     }
   }
 }
@@ -221,21 +332,36 @@ function findTxtChapterForOffset(offset: number): string {
 }
 
 async function scrollToTxtOffset(offset: number) {
+  const n = txtParagraphs.value.length
+  if (n === 0) return
+  if (txtParaOffsets.length !== n + 1) {
+    recalculateTxtVirtualMetrics()
+  }
+  const targetIdx = findParaIndexByOffset(offset)
+  const targetY = txtParaOffsets[targetIdx] || 0
+  virtualStartIdx.value = Math.max(0, targetIdx - VIRTUAL_OVERSCAN)
+  virtualEndIdx.value = Math.min(n, targetIdx + VIRTUAL_OVERSCAN + 25)
+
   await nextTick()
   const container = txtScrollContainerRef.value
   if (!container) return
-  const ratio = Math.max(0, Math.min(1, offset / txtTotalLength.value))
-  const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight)
-  container.scrollTop = Math.round(maxScroll * ratio)
+  container.scrollTop = Math.round(targetY)
+  updateVirtualWindow(container.scrollTop, true)
 }
 
 function handleTxtScroll() {
   if (currentBook.value?.format !== 'txt' || settingsStore.settings.viewMode !== 'scroll') return
   const container = txtScrollContainerRef.value
   if (!container) return
+
+  const scrollTop = container.scrollTop
+  updateVirtualWindow(scrollTop)
+
+  const paraIdx = findParaIndexAtY(scrollTop)
+  const para = txtParagraphs.value[paraIdx]
+  const approxOffset = para ? para.startOffset : 0
   const maxScroll = Math.max(1, container.scrollHeight - container.clientHeight)
-  const ratio = Math.max(0, Math.min(1, container.scrollTop / maxScroll))
-  const approxOffset = Math.round(ratio * txtTotalLength.value)
+  const ratio = Math.max(0, Math.min(1, scrollTop / maxScroll))
   const pct = Math.round(ratio * 1000) / 10
   const locator = `offset:${approxOffset}`
   const heading = findTxtChapterForOffset(approxOffset)
@@ -402,12 +528,11 @@ async function handleSelectSearchResult(hit: SearchResultItem, query: string) {
     if (settingsStore.settings.viewMode === 'paginated') {
       recalculateTxtPages(offset)
     } else {
+      await scrollToTxtOffset(offset)
       await nextTick()
       const paraEl = document.getElementById(`txt-para-${hit.matchIndex}`)
       if (paraEl) {
         paraEl.scrollIntoView({ behavior: 'smooth', block: 'center' })
-      } else {
-        await scrollToTxtOffset(offset)
       }
     }
   }
@@ -458,31 +583,58 @@ function handleKeydown(e: KeyboardEvent) {
   }
 }
 
+let layoutRafId: number | null = null
+
+function scheduleTxtLayoutUpdate(targetOffset: number) {
+  if (layoutRafId !== null) {
+    cancelAnimationFrame(layoutRafId)
+  }
+  layoutRafId = requestAnimationFrame(async () => {
+    layoutRafId = null
+    updateViewportMeasurements()
+    if (settingsStore.settings.viewMode === 'paginated') {
+      recalculateTxtPages(targetOffset)
+    } else {
+      recalculateTxtVirtualMetrics()
+      await scrollToTxtOffset(targetOffset)
+    }
+  })
+}
+
 function handleResize() {
-  updateViewportMeasurements()
-  if (currentBook.value?.format === 'txt' && settingsStore.settings.viewMode === 'paginated') {
-    recalculateTxtPages(parseOffsetLocator(currentLocator.value))
+  if (currentBook.value?.format === 'txt') {
+    scheduleTxtLayoutUpdate(parseOffsetLocator(currentLocator.value))
+  } else {
+    updateViewportMeasurements()
   }
 }
 
-// React to viewer settings changes in real time
+// React to EPUB settings changes (including theme)
 watch(
   () => settingsStore.settings,
-  async (newSettings) => {
+  (newSettings) => {
     if (currentBook.value?.format === 'epub') {
       epubEngine?.applySettings(newSettings)
-    } else if (currentBook.value?.format === 'txt') {
-      const offset = parseOffsetLocator(currentLocator.value)
-      await nextTick()
-      updateViewportMeasurements()
-      if (newSettings.viewMode === 'paginated') {
-        recalculateTxtPages(offset)
-      } else {
-        await scrollToTxtOffset(offset)
-      }
     }
   },
   { deep: true }
+)
+
+// React to TXT layout settings changes (ignores pure theme changes so theme switching is 0ms)
+watch(
+  () => [
+    settingsStore.settings.viewMode,
+    settingsStore.settings.fontSize,
+    settingsStore.settings.lineHeight,
+    settingsStore.settings.pageMargin,
+    settingsStore.settings.fontFamily
+  ],
+  () => {
+    if (currentBook.value?.format === 'txt') {
+      const offset = parseOffsetLocator(currentLocator.value)
+      scheduleTxtLayoutUpdate(offset)
+    }
+  }
 )
 
 onMounted(() => {
@@ -492,6 +644,9 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  if (layoutRafId !== null) {
+    cancelAnimationFrame(layoutRafId)
+  }
   window.removeEventListener('keydown', handleKeydown)
   window.removeEventListener('resize', handleResize)
   epubEngine?.destroy()
@@ -500,7 +655,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div
-    class="h-screen flex flex-col overflow-hidden"
+    class="h-full w-full flex flex-col overflow-hidden"
     :style="{
       backgroundColor: 'var(--ev-reader-bg)',
       color: 'var(--ev-text)'
@@ -664,7 +819,7 @@ onBeforeUnmount(() => {
 
       <!-- 2. TXT Viewer Canvas -->
       <template v-else-if="currentBook?.format === 'txt'">
-        <!-- 2-A. TXT Vertical Scroll Mode -->
+        <!-- 2-A. TXT Vertical Scroll Mode (Virtualized for instant option changes) -->
         <div
           v-if="settingsStore.settings.viewMode === 'scroll'"
           ref="txtScrollContainerRef"
@@ -672,7 +827,7 @@ onBeforeUnmount(() => {
           @scroll.passive="handleTxtScroll"
         >
           <article
-            class="max-w-4xl mx-auto py-8 transition-all"
+            class="max-w-4xl mx-auto py-8"
             :style="{
               fontFamily: fontFamilyCss,
               fontSize: `${settingsStore.settings.fontSize}px`,
@@ -681,11 +836,12 @@ onBeforeUnmount(() => {
               paddingRight: `${settingsStore.settings.pageMargin}px`
             }"
           >
+            <div v-if="virtualTopSpacerPx > 0" :style="{ height: `${virtualTopSpacerPx}px` }" />
             <p
-              v-for="para in txtParagraphs"
+              v-for="para in virtualVisibleParagraphs"
               :id="`txt-para-${para.index}`"
               :key="para.index"
-              class="mb-3 break-words rounded-lg transition-colors"
+              class="mb-3 break-words rounded-lg"
               :class="[
                 para.isHeading ? 'font-bold text-[1.2em] mt-6 mb-3 text-indigo-600 dark:text-indigo-400' : '',
                 highlightedParaIndex === para.index ? 'bg-amber-400/25 px-2 py-1 ring-1 ring-amber-400' : ''
@@ -693,6 +849,7 @@ onBeforeUnmount(() => {
             >
               {{ para.text || '\u00A0' }}
             </p>
+            <div v-if="virtualBottomSpacerPx > 0" :style="{ height: `${virtualBottomSpacerPx}px` }" />
           </article>
         </div>
 

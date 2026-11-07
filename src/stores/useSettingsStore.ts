@@ -3,10 +3,10 @@ import { ref, watch } from 'vue'
 import type { FontFamilyOption, ThemeMode, ViewerSettings, ViewMode } from '@/types'
 import { platformStorage } from '@/services/storage/platformAdapter'
 
-const SETTINGS_STORAGE_KEY = 'viewer_settings_v1'
+const SETTINGS_STORAGE_KEY = 'viewer_settings_v2'
 
 const DEFAULT_SETTINGS: ViewerSettings = {
-  viewMode: 'paginated',
+  viewMode: 'scroll',
   theme: 'light',
   fontFamily: 'sans',
   fontSize: 18,
@@ -31,13 +31,28 @@ export const useSettingsStore = defineStore('settings', () => {
     isLoaded.value = true
   }
 
+  let lastAppliedTheme: ThemeMode | null = null
+  let saveSettingsTimer: ReturnType<typeof setTimeout> | null = null
+
   function applyGlobalThemeClass(theme: ThemeMode) {
     if (typeof document === 'undefined') return
+    if (lastAppliedTheme === theme && document.documentElement.classList.contains(`theme-${theme}`)) {
+      return
+    }
+    lastAppliedTheme = theme
     const root = document.documentElement
     root.classList.remove('theme-light', 'theme-dark', 'theme-sepia', 'dark')
     root.classList.add(`theme-${theme}`)
     if (theme === 'dark') {
       root.classList.add('dark')
+    }
+    try {
+      const androidBridge = (window as any).__EASYVIEWER_ANDROID__
+      if (androidBridge && typeof androidBridge.setSystemBarTheme === 'function') {
+        androidBridge.setSystemBarTheme(theme)
+      }
+    } catch {
+      // Ignore if not on Android WebView
     }
   }
 
@@ -73,9 +88,15 @@ export const useSettingsStore = defineStore('settings', () => {
 
   watch(
     settings,
-    async (newVal) => {
+    (newVal) => {
       applyGlobalThemeClass(newVal.theme)
-      await platformStorage.setItem(SETTINGS_STORAGE_KEY, newVal)
+      if (saveSettingsTimer) {
+        clearTimeout(saveSettingsTimer)
+      }
+      const snapshot = { ...newVal }
+      saveSettingsTimer = setTimeout(() => {
+        platformStorage.setItem(SETTINGS_STORAGE_KEY, snapshot)
+      }, 250)
     },
     { deep: true }
   )

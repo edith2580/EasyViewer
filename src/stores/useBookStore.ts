@@ -158,13 +158,18 @@ export const useBookStore = defineStore('books', () => {
     await persistAll()
   }
 
+  let cachedDeviceId: string | null = null
+  let saveLocationTimer: ReturnType<typeof setTimeout> | null = null
+
   async function saveReadingLocation(
     bookId: string,
     locator: string,
     percentage: number,
     chapterTitle?: string
   ) {
-    const deviceId = await getOrCreateDeviceId()
+    if (!cachedDeviceId) {
+      cachedDeviceId = await getOrCreateDeviceId()
+    }
     const now = Date.now()
     const location: ReadingLocation = {
       bookId,
@@ -172,7 +177,7 @@ export const useBookStore = defineStore('books', () => {
       percentage: Math.min(100, Math.max(0, Math.round(percentage * 10) / 10)),
       chapterTitle,
       updatedAt: now,
-      deviceId
+      deviceId: cachedDeviceId
     }
     positions.value[bookId] = location
 
@@ -182,8 +187,13 @@ export const useBookStore = defineStore('books', () => {
       target.lastOpenedAt = now
     }
 
-    await platformStorage.setItem(POSITIONS_KEY, positions.value)
-    await platformStorage.setItem(BOOKS_META_KEY, books.value)
+    if (saveLocationTimer) {
+      clearTimeout(saveLocationTimer)
+    }
+    saveLocationTimer = setTimeout(async () => {
+      await platformStorage.setItem(POSITIONS_KEY, positions.value)
+      await platformStorage.setItem(BOOKS_META_KEY, books.value)
+    }, 400)
   }
 
   function getBookBookmarks(bookId: string): BookmarkItem[] {

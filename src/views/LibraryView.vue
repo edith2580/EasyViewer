@@ -220,7 +220,7 @@ function formatFileSize(bytes: number): string {
 
 <template>
   <div
-    class="h-screen flex flex-col overflow-hidden select-none"
+    class="h-full w-full flex flex-col overflow-hidden select-none"
     @dragover.prevent="handleWindowDragOver"
     @drop.prevent="handleDrop"
   >
