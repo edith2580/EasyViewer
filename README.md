@@ -149,9 +149,9 @@ where.exe rustc
 where.exe cargo
 ```
 
-## 빌드 명령어
+# 빌드 명령어
 
-### windows
+## windows
 
 설치 마법사 없이 단독 .exe 실행 파일만 빠르게 빌드:
 ```bash
@@ -176,4 +176,45 @@ npm run tauri build -- --bundles msi
 단독 실행 파일 (Portable .exe): src-tauri/target/release/easy-viewer.exe
 NSIS 설치 프로그램: src-tauri/target/release/bundle/nsis/EasyViewer_0.1.0_x64-setup.exe
 MSI 설치 패키지: src-tauri/target/release/bundle/msi/EasyViewer_0.1.0_x64_en-US.msi
+```
+
+## IOS
+
+macOS 개발 실행
+```bash
+npm run mac:dev	
+```
+
+macOS 유니버설(Apple Silicon + Intel) 빌드
+```bash
+npm run mac:build	
+```
+
+아키텍처별 macOS 빌드
+```bash
+npm run mac:build:arm / mac:build:intel	
+```
+
+iOS(Xcode) 프로젝트 생성
+```bash
+npm run ios:init	
+```
+
+iOS 개발 실행 / 빌드
+```bash
+npm run ios:dev / ios:build	
+```
+
+### macOS에서 직접 해야 할 일
+
+```text
+1. Rust 타깃 추가: rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
+
+2. npm run ios:init 실행 후 src-tauri/gen/apple이 생성되면 git에 커밋합니다.
+
+3. 실기기나 App Store용 iOS 빌드는 Xcode 설치와 Apple Developer 계정이 필요합니다. 환경변수 APPLE_DEVELOPMENT_TEAM으로 팀 ID를 지정합니다.
+
+4. macOS 앱을 외부에 배포하려면 코드 서명과 공증(notarization)이 필요합니다.
+
+5. 아이콘은 이미 icon.icns와 iOS용 AppIcon 세트가 생성되어 있어서, ios:init 후 npx tauri icon src-tauri/icons/app-icon.png로 한 번 더 적용하면 됩니다.
 ```

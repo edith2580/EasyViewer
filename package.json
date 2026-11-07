@@ -12,7 +12,14 @@
     "android:init": "node scripts/android.mjs init --ci",
     "android:dev": "node scripts/android.mjs dev",
     "android:build": "node scripts/android.mjs build --apk --debug --target aarch64",
-    "android:build:all": "node scripts/android.mjs build --apk --debug"
+    "android:build:all": "node scripts/android.mjs build --apk --debug",
+    "mac:dev": "tauri dev",
+    "mac:build": "tauri build --target universal-apple-darwin",
+    "mac:build:arm": "tauri build --target aarch64-apple-darwin",
+    "mac:build:intel": "tauri build --target x86_64-apple-darwin",
+    "ios:init": "tauri ios init",
+    "ios:dev": "tauri ios dev",
+    "ios:build": "tauri ios build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",
