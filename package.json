@@ -1,0 +1,42 @@
+{
+  "name": "easy-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "description": "심플한 Text, EPUB 범용 문서 뷰어 (Vue3 + TypeScript + Tauri 2 + epub.js)",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "android:init": "node scripts/android.mjs init --ci",
+    "android:dev": "node scripts/android.mjs dev",
+    "android:build": "node scripts/android.mjs build --apk --debug --target aarch64",
+    "android:build:all": "node scripts/android.mjs build --apk --debug"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.2.0",
+    "@tauri-apps/plugin-dialog": "^2.2.0",
+    "@tauri-apps/plugin-fs": "^2.2.0",
+    "@tauri-apps/plugin-http": "^2.2.0",
+    "@tauri-apps/plugin-store": "^2.2.0",
+    "epubjs": "^0.3.93",
+    "jszip": "^3.10.1",
+    "lucide-vue-next": "^0.468.0",
+    "pinia": "^2.3.0",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.2.0",
+    "@types/node": "^22.10.0",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "typescript": "~5.6.3",
+    "vite": "^6.0.5",
+    "vue-tsc": "^2.2.0"
+  }
+}
+

@@ -1,0 +1,23 @@
+[package]
+name = "easy-viewer"
+version = "0.1.0"
+description = "심플한 Text, EPUB 범용 문서 뷰어"
+authors = ["EasyViewer Team"]
+edition = "2021"
+
+[lib]
+name = "easy_viewer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-fs = "2"
+tauri-plugin-http = "2"
+tauri-plugin-store = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
