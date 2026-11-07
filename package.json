@@ -13,6 +13,8 @@
     "android:dev": "node scripts/android.mjs dev",
     "android:build": "node scripts/android.mjs build --apk --debug --target aarch64",
     "android:build:all": "node scripts/android.mjs build --apk --debug",
+    "android:release": "node scripts/android.mjs build --apk --target aarch64",
+    "android:release:all": "node scripts/android.mjs build --apk",
     "mac:dev": "tauri dev",
     "mac:build": "tauri build --target universal-apple-darwin",
     "mac:build:arm": "tauri build --target aarch64-apple-darwin",

@@ -28,7 +28,11 @@ if (!env.NDK_HOME && env.ANDROID_HOME) {
   }
 }
 
-const args = ['tauri', 'android', ...process.argv.slice(2)]
+const isWin = process.platform === 'win32'
+const tauriBin = path.join(process.cwd(), 'node_modules', '.bin', isWin ? 'tauri.cmd' : 'tauri')
+const tauriCmd = fs.existsSync(tauriBin) ? `"${tauriBin}"` : 'tauri'
+
+const args = [tauriCmd, 'android', ...process.argv.slice(2)]
 const child = spawn(args.join(' '), {
   stdio: 'inherit',
   shell: true,
