@@ -1,7 +1,7 @@
 {
   "name": "easy-viewer",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "심플한 Text, EPUB 범용 문서 뷰어 (Vue3 + TypeScript + Tauri 2 + epub.js)",
   "type": "module",
   "scripts": {

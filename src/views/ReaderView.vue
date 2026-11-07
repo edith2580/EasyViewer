@@ -139,6 +139,7 @@ function recalculateTxtVirtualMetrics() {
   const linePx = fontSize * lineHeight
   const charsPerLine = Math.max(12, Math.floor(usableWidth / (fontSize * 0.92)))
 
+  const heights = new Float64Array(n)
   let y = 0
   for (let i = 0; i < n; i++) {
     offsets[i] = y
@@ -146,13 +147,86 @@ function recalculateTxtVirtualMetrics() {
     const len = p.text.length
     const lines = len === 0 ? 1 : Math.ceil(len / charsPerLine)
     const headingExtra = p.isHeading ? 36 : 0
-    y += lines * linePx + 12 + headingExtra
+    const h = lines * linePx + 12 + headingExtra
+    heights[i] = h
+    y += h
   }
   offsets[n] = y
+  txtParaHeights = heights
   txtParaOffsets = offsets
   virtualTotalHeight.value = y
   virtualMetricsVersion.value++
 }
+
+// The initial paragraph heights are only estimates. Once paragraphs are actually rendered,
+// replace the estimates with real measured heights; otherwise spacer sizes drift from the
+// real layout and the viewport jumps (typically back toward the top) while wheel-scrolling.
+let txtParaHeights = new Float64Array(0)
+let isMeasuringTxt = false
+
+async function measureRenderedParagraphs() {
+  if (isMeasuringTxt) return
+  const container = txtScrollContainerRef.value
+  const n = txtParagraphs.value.length
+  if (!container || n === 0 || txtParaHeights.length !== n) return
+  const start = virtualStartIdx.value
+  const end = virtualEndIdx.value
+  if (end - start < 2) return
+
+  isMeasuringTxt = true
+  try {
+    let changed = false
+    const newHeights = txtParaHeights.slice()
+    let prevTop = -1
+    let prevIdx = -1
+    for (let i = start; i < end; i++) {
+      const el = document.getElementById(`txt-para-${i}`) as HTMLElement | null
+      if (!el) {
+        prevIdx = -1
+        continue
+      }
+      const top = el.offsetTop
+      if (prevIdx >= 0 && prevIdx === i - 1) {
+        const h = top - prevTop
+        if (h > 0 && Math.abs(h - newHeights[prevIdx]) > 0.5) {
+          newHeights[prevIdx] = h
+          changed = true
+        }
+      }
+      prevTop = top
+      prevIdx = i
+    }
+    if (!changed) return
+
+    const oldOffsets = txtParaOffsets
+    const scrollTop = container.scrollTop
+    const anchor = findParaIndexAtY(scrollTop)
+    const anchorDelta = scrollTop - (oldOffsets[anchor] || 0)
+
+    const offsets = new Float64Array(n + 1)
+    let y = 0
+    for (let i = 0; i < n; i++) {
+      offsets[i] = y
+      y += newHeights[i]
+    }
+    offsets[n] = y
+    txtParaHeights = newHeights
+    txtParaOffsets = offsets
+    virtualTotalHeight.value = y
+    virtualMetricsVersion.value++
+
+    await nextTick()
+    if (scrollTop > 0) {
+      container.scrollTop = Math.round(offsets[anchor] + anchorDelta)
+    }
+  } finally {
+    isMeasuringTxt = false
+  }
+}
+
+watch([virtualStartIdx, virtualEndIdx, virtualMetricsVersion], () => measureRenderedParagraphs(), {
+  flush: 'post'
+})
 
 function findParaIndexAtY(y: number): number {
   const n = txtParagraphs.value.length
