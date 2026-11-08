@@ -66,7 +66,8 @@ export function detectAndDecodeText(buffer: ArrayBuffer): { text: string; encodi
   }
 }
 
-const HEADING_REGEX = /^(제\s*\d+\s*[장화편절부]|Chapter\s+\d+|CHAPTER\s+\d+|\[.+?\]|\d+\.\s+.+|#{1,3}\s+.+)/
+//const HEADING_REGEX = /^(제\s*\d+\s*[장화편절부]|Chapter\s+\d+|CHAPTER\s+\d+|\[.+?\]|\d+\.\s+.+|#{1,3}\s+.+)/
+const HEADING_REGEX = /^(제\s*\d+\s*[장화편절부]|\d+\s*화|CHAPTER\s+\d+|\d+\.\s+.+|#{1,3}\s+.+)/i;
 
 /**
  * Parses raw text into structured paragraphs with character offsets and automatic chapter detection.
