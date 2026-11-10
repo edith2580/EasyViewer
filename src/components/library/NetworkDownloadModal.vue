@@ -812,7 +812,7 @@ function formatItemDate(rawDate?: string): string {
                     v-model="webdavUrl"
                     type="url"
                     required
-                    placeholder="https://example.synology.me:5006/Comic"
+                    placeholder="https://example.synology.me"
                     class="w-full px-3 py-1.5 rounded-xl border text-xs bg-transparent focus:outline-none focus:ring-2 focus:ring-indigo-500"
                     :style="{ borderColor: 'var(--ev-border)' }"
                   />

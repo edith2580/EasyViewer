@@ -78,7 +78,7 @@ export const useBookStore = defineStore('books', () => {
     await addBookFromBuffer(epubBuffer, 'EasyViewer 완벽 가이드 및 샘플 북.epub', 'epub')
 
     const txtBuffer = createSampleTxtBook()
-    await addBookFromBuffer(txtBuffer, '메밀꽃 필 무렵 - 이효석.txt', 'txt')
+    await addBookFromBuffer(txtBuffer, '윤동주 시선 - 별 헤는 밤.txt', 'txt')
   }
 
   async function addBookFromBuffer(
