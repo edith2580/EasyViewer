@@ -1,7 +1,7 @@
 {
   "name": "easy-viewer",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "심플한 Text, EPUB 범용 문서 뷰어 (Vue3 + TypeScript + Tauri 2 + epub.js)",
   "type": "module",
   "scripts": {
@@ -21,7 +21,8 @@
     "mac:build:intel": "tauri build --target x86_64-apple-darwin",
     "ios:init": "tauri ios init",
     "ios:dev": "tauri ios dev",
-    "ios:build": "tauri ios build"
+    "ios:build": "tauri ios build",
+    "ios:install": "xcrun devicectl device install app --device 00008120-001A44101E38C01E src-tauri/gen/apple/build/easy-viewer_iOS.xcarchive/Products/Applications/EasyViewer.app"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",
@@ -48,4 +49,3 @@
     "vue-tsc": "^2.2.0"
   }
 }
-

@@ -46,6 +46,32 @@ export const useSettingsStore = defineStore('settings', () => {
     if (theme === 'dark') {
       root.classList.add('dark')
     }
+
+    // HTML meta theme-color 및 color-scheme 동적 업데이트
+    try {
+      let themeMeta = document.querySelector('meta[name="theme-color"]')
+      if (!themeMeta) {
+        themeMeta = document.createElement('meta')
+        themeMeta.setAttribute('name', 'theme-color')
+        document.head.appendChild(themeMeta)
+      }
+      const themeColor = theme === 'dark' ? '#111827' : (theme === 'sepia' ? '#f8f1e3' : '#ffffff')
+      themeMeta.setAttribute('content', themeColor)
+      root.style.colorScheme = theme === 'dark' ? 'dark' : 'light'
+    } catch {
+      // Ignore if DOM manipulation fails
+    }
+
+    // iOS WebKit 네이티브 브릿지 (상태바 스타일 및 윈도우 UIUserInterfaceStyle 동기화)
+    try {
+      const iosBridge = (window as any).webkit?.messageHandlers?.easyviewer_theme
+      if (iosBridge && typeof iosBridge.postMessage === 'function') {
+        iosBridge.postMessage(theme)
+      }
+    } catch {
+      // Ignore if not on iOS WKWebView
+    }
+
     try {
       const androidBridge = (window as any).__EASYVIEWER_ANDROID__
       if (androidBridge && typeof androidBridge.setSystemBarTheme === 'function') {

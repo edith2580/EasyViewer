@@ -50,7 +50,7 @@ body {
 }
 
 #app {
-  padding-top: env(safe-area-inset-top, 0px);
+  /* padding-top은 헤더 컴포넌트가 status bar(노치) 영역까지 배경색을 채우도록 각 뷰의 header에서 처리합니다 */
   padding-bottom: env(safe-area-inset-bottom, 0px);
   padding-left: env(safe-area-inset-left, 0px);
   padding-right: env(safe-area-inset-right, 0px);

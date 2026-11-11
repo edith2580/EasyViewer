@@ -98,6 +98,7 @@ function formatDate(ts: number): string {
     <aside
       class="w-full max-w-md h-full flex flex-col border-r shadow-2xl transition-all"
       :style="{
+        paddingTop: 'env(safe-area-inset-top, 0px)',
         backgroundColor: 'var(--ev-surface)',
         borderColor: 'var(--ev-border)',
         color: 'var(--ev-text)'

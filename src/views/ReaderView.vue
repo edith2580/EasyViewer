@@ -786,8 +786,10 @@ onBeforeUnmount(() => {
   >
     <!-- Top Reader Navigation Bar -->
     <header
-      class="h-14 px-3 sm:px-6 border-b flex items-center justify-between gap-2 shrink-0 z-20"
+      class="px-3 sm:px-6 border-b flex items-center justify-between gap-2 shrink-0 z-20"
       :style="{
+        paddingTop: 'env(safe-area-inset-top, 0px)',
+        minHeight: 'calc(env(safe-area-inset-top, 0px) + 3.5rem)',
         backgroundColor: 'var(--ev-surface)',
         borderColor: 'var(--ev-border)'
       }"

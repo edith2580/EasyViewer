@@ -228,3 +228,15 @@ npm run ios:dev / ios:build
 
 2. macOS 앱을 외부에 배포하려면 코드 서명과 공증(notarization)이 필요합니다.
 ```
+
+### mac 에서 빌드시 Websocket 오류시 호출
+
+```bash
+kill -9 $(lsof -t -i :1420 -i :1421) 2>/dev/null; find src-tauri/target -name "lock.ios" -delete 2>/dev/null
+
+pgrep -lf "cargo|tauri|xcodebuild|rustc"
+
+kill -9 34094 36307 2>/dev/null; find src-tauri/target -name "lock.ios" -delete 2>/dev/null; find src-tauri/target -name ".cargo*-lock" -delete 2>/dev/null
+
+kill -9 $(lsof -t -i :1420 -i :1421) 2>/dev/null
+```

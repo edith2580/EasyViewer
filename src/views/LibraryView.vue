@@ -226,8 +226,9 @@ function formatFileSize(bytes: number): string {
   >
     <!-- Header -->
     <header
-      class="px-4 sm:px-8 py-4 border-b flex flex-wrap items-center justify-between gap-3 shrink-0"
+      class="px-4 sm:px-8 pb-4 border-b flex flex-wrap items-center justify-between gap-3 shrink-0"
       :style="{
+        paddingTop: 'calc(env(safe-area-inset-top, 0px) + 1rem)',
         backgroundColor: 'var(--ev-surface)',
         borderColor: 'var(--ev-border)'
       }"
