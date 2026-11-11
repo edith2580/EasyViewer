@@ -236,7 +236,7 @@ kill -9 $(lsof -t -i :1420 -i :1421) 2>/dev/null; find src-tauri/target -name "l
 
 pgrep -lf "cargo|tauri|xcodebuild|rustc"
 
-kill -9 34094 36307 2>/dev/null; find src-tauri/target -name "lock.ios" -delete 2>/dev/null; find src-tauri/target -name ".cargo*-lock" -delete 2>/dev/null
+kill -9 7540 12689 2>/dev/null; find src-tauri/target -name "lock.ios" -delete 2>/dev/null; find src-tauri/target -name ".cargo*-lock" -delete 2>/dev/null
 
 kill -9 $(lsof -t -i :1420 -i :1421) 2>/dev/null
 ```

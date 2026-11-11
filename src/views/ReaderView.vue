@@ -1044,8 +1044,10 @@ onBeforeUnmount(() => {
 
     <!-- Bottom Progress Bar -->
     <footer
-      class="h-12 px-4 sm:px-6 border-t flex items-center justify-between gap-4 text-xs shrink-0 z-20"
+      class="px-4 sm:px-6 border-t flex items-center justify-between gap-4 text-xs shrink-0 z-20"
       :style="{
+        paddingBottom: 'env(safe-area-inset-bottom, 0px)',
+        height: 'calc(env(safe-area-inset-bottom, 0px) + 3rem)',
         backgroundColor: 'var(--ev-surface)',
         borderColor: 'var(--ev-border)'
       }"

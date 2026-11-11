@@ -339,7 +339,12 @@ function formatFileSize(bytes: number): string {
     </div>
 
     <!-- Main Library Grid -->
-    <main class="flex-1 overflow-y-auto px-4 sm:px-8 pb-10">
+    <main
+      class="flex-1 overflow-y-auto px-4 sm:px-8 pb-10"
+      :style="{
+        paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 2.5rem)'
+      }"
+    >
       <!-- Empty state -->
       <div
         v-if="filteredBooks.length === 0"

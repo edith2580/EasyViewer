@@ -45,23 +45,30 @@ const fonts: Array<{ value: FontFamilyOption; label: string; previewClass: strin
 <template>
   <div
     v-if="open"
-    class="fixed inset-0 z-50 flex items-start justify-end p-4 sm:p-6 bg-black/30 backdrop-blur-[1px]"
+    class="fixed inset-0 z-50 flex items-start justify-end overflow-y-auto bg-black/40 backdrop-blur-[1px]"
+    :style="{
+      paddingTop: 'calc(env(safe-area-inset-top, 0px) + 1rem)',
+      paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 1rem)',
+      paddingLeft: 'calc(env(safe-area-inset-left, 0px) + 1rem)',
+      paddingRight: 'calc(env(safe-area-inset-right, 0px) + 1rem)'
+    }"
     @click.self="emit('close')"
   >
     <div
-      class="w-full max-w-sm rounded-2xl border shadow-2xl p-5 transition-all"
+      class="w-full max-w-sm rounded-2xl border shadow-2xl p-5 transition-all overflow-y-auto"
       :style="{
         backgroundColor: 'var(--ev-surface)',
         borderColor: 'var(--ev-border)',
-        color: 'var(--ev-text)'
+        color: 'var(--ev-text)',
+        maxHeight: 'calc(100vh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 2.5rem)'
       }"
     >
-      <div class="flex items-center justify-between pb-3 mb-4 border-b" :style="{ borderColor: 'var(--ev-border)' }">
+      <div class="flex items-center justify-between pb-3 mb-4 border-b shrink-0" :style="{ borderColor: 'var(--ev-border)' }">
         <h3 class="text-base font-bold tracking-tight">뷰어 보기 옵션</h3>
         <div class="flex items-center gap-1">
           <button
             type="button"
-            class="p-1.5 rounded-lg opacity-75 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/10"
+            class="p-2 rounded-xl opacity-75 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/10 active:scale-95 transition-all"
             title="기본값 초기화"
             @click="settingsStore.resetSettings()"
           >
@@ -69,7 +76,8 @@ const fonts: Array<{ value: FontFamilyOption; label: string; previewClass: strin
           </button>
           <button
             type="button"
-            class="p-1.5 rounded-lg opacity-75 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/10"
+            class="p-2 rounded-xl opacity-75 hover:opacity-100 hover:bg-black/5 dark:hover:bg-white/10 active:scale-95 transition-all"
+            title="닫기"
             @click="emit('close')"
           >
             <X class="w-4 h-4" />

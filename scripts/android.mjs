@@ -4,6 +4,11 @@ import path from 'node:path'
 
 const env = { ...process.env }
 
+// Android 15+ 16KB 페이지 사이즈 호환성 및 DT_HASH 플래그 강제 주입
+const extraRustFlags = ['-C', 'link-arg=-Wl,-z,max-page-size=16384', '-C', 'link-arg=-Wl,--hash-style=both']
+env.RUSTFLAGS = [env.RUSTFLAGS || '', ...extraRustFlags].filter(Boolean).join(' ')
+env.CARGO_ENCODED_RUSTFLAGS = [env.CARGO_ENCODED_RUSTFLAGS || '', ...extraRustFlags].filter(Boolean).join('\x1f')
+
 if (!env.JAVA_HOME && fs.existsSync('D:\\android\\jdk-21')) {
   env.JAVA_HOME = 'D:\\android\\jdk-21'
 }
