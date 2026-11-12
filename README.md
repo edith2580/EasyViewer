@@ -240,3 +240,15 @@ kill -9 7540 12689 2>/dev/null; find src-tauri/target -name "lock.ios" -delete 2
 
 kill -9 $(lsof -t -i :1420 -i :1421) 2>/dev/null
 ```
+
+## 개발/디버깅용으로 Xcode 열기:
+
+```bash
+npx tauri ios dev --open
+```
+
+## 릴리스/아카이브(App Store 배포 등)용으로 Xcode 열기:
+
+```bash
+npx tauri ios build --open
+```
