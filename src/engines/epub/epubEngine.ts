@@ -56,6 +56,77 @@ function collapseCfiString(cfiStr: string, toStart = true): string {
   return cfiStr
 }
 
+/**
+ * Why the content iframe allows scripts, and how book scripts are still kept out:
+ *
+ * epub.js renders each section in an iframe sandboxed with `allow-same-origin` only. WebKit (iOS and
+ * macOS WKWebView, Safari) does not run *any* event listener in a document whose sandbox forbids
+ * scripts — including the listeners this app attaches from the parent page. So on iOS no tap,
+ * click or touch inside the book ever reached the reader (center-tap menu, tap-to-turn pages, and
+ * epub.js's own in-book link handling were all dead), while Chromium happened to work.
+ *
+ * The rendition is therefore created with `allowScriptedContent: true`, and every section document
+ * is sanitized before it is serialized into the iframe:
+ *  - a Content-Security-Policy `<meta>` (script-src 'none', …) is inserted first in <head>, which
+ *    blocks inline scripts, event-handler attributes and `javascript:` URLs in the book;
+ *  - script/iframe/object/embed-like elements, `on*` attributes, `javascript:` URLs and meta
+ *    refreshes are removed as a second line of defense.
+ * Listeners added by this app are parent-page functions, which CSP does not block.
+ */
+const CONTENT_CSP =
+  "script-src 'none'; object-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; form-action 'none'"
+const XHTML_NS = 'http://www.w3.org/1999/xhtml'
+const ACTIVE_ELEMENTS = ['script', 'iframe', 'frame', 'frameset', 'object', 'embed', 'applet', 'portal']
+const URL_ATTRIBUTES = new Set(['href', 'src', 'action', 'formaction', 'data', 'xlink:href', 'srcdoc'])
+
+function isScriptUrl(value: string): boolean {
+  const normalized = value.replace(/[\s\u0000-\u001f]/g, '').toLowerCase()
+  return (
+    normalized.startsWith('javascript:') ||
+    normalized.startsWith('vbscript:') ||
+    normalized.startsWith('data:text/html')
+  )
+}
+
+function sanitizeSectionDocument(doc: Document): void {
+  const root = doc?.documentElement
+  if (!root) return
+
+  for (const name of ACTIVE_ELEMENTS) {
+    for (const el of Array.from(doc.getElementsByTagNameNS('*', name))) el.remove()
+  }
+
+  for (const el of Array.from(doc.getElementsByTagNameNS('*', '*'))) {
+    if (el.localName === 'meta' && /refresh/i.test(el.getAttribute('http-equiv') || '')) {
+      el.remove()
+      continue
+    }
+    for (const attr of Array.from(el.attributes)) {
+      const name = attr.name.toLowerCase()
+      if (name.startsWith('on') || (URL_ATTRIBUTES.has(name) && isScriptUrl(attr.value))) {
+        el.removeAttributeNode(attr)
+      }
+    }
+  }
+
+  const ns = root.namespaceURI || XHTML_NS
+  let head = doc.getElementsByTagNameNS('*', 'head')[0]
+  if (!head) {
+    head = doc.createElementNS(ns, 'head')
+    root.insertBefore(head, root.firstChild)
+  }
+  const csp = doc.createElementNS(ns, 'meta')
+  csp.setAttribute('http-equiv', 'Content-Security-Policy')
+  csp.setAttribute('content', CONTENT_CSP)
+  head.insertBefore(csp, head.firstChild)
+}
+
+const TAP_MAX_DURATION_MS = 500
+const TAP_MAX_MOVE_PX = 10
+/** A touch starting sooner than this after a scroll is stopping a fling, not tapping. */
+const TAP_SCROLL_QUIET_MS = 150
+const TAP_CLICK_SUPPRESS_MS = 800
+
 export class EpubViewerEngine {
   private book: Book | null = null
   private rendition: Rendition | null = null
@@ -70,6 +141,10 @@ export class EpubViewerEngine {
   // View mode the current rendition was created with (the view manager differs per mode).
   private renderedViewMode: ViewerSettings['viewMode'] | null = null
   private rebuildPromise: Promise<void> | null = null
+  // Tap detection state (see handleContentTouchStart).
+  private touchTap: { x: number; y: number; time: number; scrollTop: number; scrollLeft: number } | null = null
+  private suppressClickUntil = 0
+  private lastScrollAt = 0
 
   /**
    * Registers a callback for plain taps/clicks inside the rendered EPUB iframe.
@@ -80,16 +155,78 @@ export class EpubViewerEngine {
     this.tapHandler = handler
   }
 
+  /**
+   * Taps are detected from touch events rather than relying on `click` alone: iOS WebKit does not
+   * synthesize a click for a tap on non-interactive content when the only click listener is on
+   * the document (which is where epub.js listens inside the iframe). The click that may still
+   * follow a detected tap is suppressed so a tap is never handled twice; mouse clicks (desktop)
+   * still go through handleContentClick.
+   *
+   * Movement is measured in the parent viewport (iframe position + touch position): in scroll mode
+   * the iframe moves together with the finger while dragging, so the touch's own clientX/Y (and on
+   * iOS also screenX/Y, which equal clientX/Y there) barely change during a drag. As a second
+   * guard, a touch during which the view scrolled at all is never a tap.
+   */
+  private handleContentTouchStart(event: TouchEvent, contents: any): void {
+    const touch = event.touches.length === 1 ? event.touches[0] : null
+    const now = performance.now()
+    // A second finger (pinch) or a touch that stops a running scroll fling is not a tap.
+    if (!touch || now - this.lastScrollAt <= TAP_SCROLL_QUIET_MS) {
+      this.touchTap = null
+      return
+    }
+    const pos = this.toParentViewport(touch.clientX, touch.clientY, contents)
+    const scroller = this.scrollPosition()
+    this.touchTap = { x: pos.x, y: pos.y, time: now, scrollTop: scroller.top, scrollLeft: scroller.left }
+  }
+
+  private handleContentTouchEnd(event: TouchEvent, contents: any): void {
+    const start = this.touchTap
+    this.touchTap = null
+    const touch = event.changedTouches[0]
+    if (!start || !touch || event.touches.length > 0) return
+    const now = performance.now()
+    const pos = this.toParentViewport(touch.clientX, touch.clientY, contents)
+    const scroller = this.scrollPosition()
+    const moved = Math.hypot(pos.x - start.x, pos.y - start.y)
+    const scrolled =
+      this.lastScrollAt > start.time ||
+      Math.abs(scroller.top - start.scrollTop) > 1 ||
+      Math.abs(scroller.left - start.scrollLeft) > 1
+    if (now - start.time > TAP_MAX_DURATION_MS || moved > TAP_MAX_MOVE_PX || scrolled) return
+    this.suppressClickUntil = now + TAP_CLICK_SUPPRESS_MS
+    this.emitContentTap(event.target as Element | null, touch.clientX, touch.clientY, contents)
+  }
+
+  private toParentViewport(x: number, y: number, contents: any): { x: number; y: number } {
+    const frame = contents?.document?.defaultView?.frameElement as HTMLElement | null | undefined
+    const rect = frame?.getBoundingClientRect()
+    return { x: x + (rect?.left ?? 0), y: y + (rect?.top ?? 0) }
+  }
+
+  private scrollPosition(): { top: number; left: number } {
+    const el: HTMLElement | undefined = (this.rendition as any)?.manager?.container
+    return { top: el?.scrollTop ?? 0, left: el?.scrollLeft ?? 0 }
+  }
+
   private handleContentClick(event: MouseEvent, contents: any): void {
+    if (performance.now() < this.suppressClickUntil) return
+    this.emitContentTap(event.target as Element | null, event.clientX, event.clientY, contents)
+  }
+
+  private emitContentTap(target: Element | null, x: number, y: number, contents: any): void {
     if (!this.tapHandler) return
     const win: Window | null | undefined = contents?.document?.defaultView
     const selection = win?.getSelection()
     if (selection && !selection.isCollapsed && selection.toString().trim()) return
-    const target = event.target as Element | null
     if (target?.closest?.('a[href], button, input, textarea, select, label')) return
 
     const frameRect = (win?.frameElement as HTMLElement | null)?.getBoundingClientRect()
-    this.tapHandler(event.clientX + (frameRect?.left ?? 0), event.clientY + (frameRect?.top ?? 0))
+    this.tapHandler(x + (frameRect?.left ?? 0), y + (frameRect?.top ?? 0))
+  }
+
+  private handleContainerScroll = (): void => {
+    this.lastScrollAt = performance.now()
   }
 
   async loadBook(
@@ -108,6 +245,8 @@ export class EpubViewerEngine {
 
     const book = ePub(buffer.slice(0))
     this.book = book
+    // Must be registered before any section is rendered (see CONTENT_CSP).
+    ;(book.spine as any).hooks.content.register(sanitizeSectionDocument)
     await book.ready
 
     const metadata = await book.loaded.metadata
@@ -127,6 +266,8 @@ export class EpubViewerEngine {
     this.buildSectionMetrics()
 
     this.container = container
+    // Scroll events don't bubble, so listen in the capture phase for the view manager's container.
+    container.addEventListener('scroll', this.handleContainerScroll, { capture: true, passive: true })
     this.onRelocated = onRelocated || null
     const rendition = this.createRendition(settings, initialLocator, initialPercentage)
 
@@ -173,13 +314,21 @@ export class EpubViewerEngine {
       manager: isScroll ? getStableScrollManager() : 'default',
       flow: isScroll ? 'scrolled' : 'paginated',
       spread: 'none',
-      allowScriptedContent: false
+      // Required for any event listener to run in WebKit; book scripts are blocked by
+      // sanitizeSectionDocument (see CONTENT_CSP).
+      allowScriptedContent: true
     })
     this.rendition = rendition
     this.renderedViewMode = settings.viewMode
 
     this.applyTheme(settings)
 
+    rendition.on('touchstart', (event: TouchEvent, contents: any) =>
+      this.handleContentTouchStart(event, contents)
+    )
+    rendition.on('touchend', (event: TouchEvent, contents: any) =>
+      this.handleContentTouchEnd(event, contents)
+    )
     rendition.on('click', (event: MouseEvent, contents: any) =>
       this.handleContentClick(event, contents)
     )
@@ -417,18 +566,57 @@ export class EpubViewerEngine {
     if (this.book.spine.get(target)) return target
 
     const [rawPath, hash] = target.split('#')
-    const cleanPath = rawPath.replace(/^(\.\.\/|\.\/)+/, '')
-    const matched = (this.book.spine.spineItems || []).find(
+    const matched = this.findSpineItem(rawPath)
+    if (matched) {
+      return hash ? `${matched.href}#${hash}` : matched.href
+    }
+    return this.resolveMissingTocTarget(target) ?? target
+  }
+
+  private findSpineItem(path: string): any | undefined {
+    if (!this.book || !path) return undefined
+    const cleanPath = path.split('#')[0].replace(/^(\.\.\/|\.\/)+/, '')
+    if (!cleanPath) return undefined
+    return (this.book.spine.spineItems || []).find(
       (item) =>
         item.href === cleanPath ||
         item.href.endsWith(cleanPath) ||
         cleanPath.endsWith(item.href) ||
         (item.canonical && item.canonical.endsWith(cleanPath))
     )
-    if (matched) {
-      return hash ? `${matched.href}#${hash}` : matched.href
+  }
+
+  /**
+   * Some EPUBs (e.g. Calibre conversions that swap the cover page for `titlepage.xhtml`) have TOC
+   * entries pointing at files that are not in the spine, so `display()` fails with
+   * "No Section Found". Such an entry is mapped by its position in the TOC: to the spine section
+   * right after the one the previous resolvable TOC entry points to (the first section if none).
+   */
+  private resolveMissingTocTarget(target: string): string | null {
+    if (!this.book) return null
+    const flat: TocItem[] = []
+    const walk = (items: TocItem[]) =>
+      items.forEach((item) => {
+        flat.push(item)
+        walk(item.subitems || [])
+      })
+    walk(this.tocList)
+
+    const idx = flat.findIndex((item) => item.href === target)
+    if (idx < 0) return null
+
+    let prevSpineIndex = -1
+    for (let i = idx - 1; i >= 0; i--) {
+      const item = this.findSpineItem(flat[i].href)
+      if (item) {
+        prevSpineIndex = item.index
+        break
+      }
     }
-    return target
+    const spineItems = this.book.spine.spineItems || []
+    if (!spineItems.length) return null
+    const fallback = spineItems[Math.min(prevSpineIndex + 1, spineItems.length - 1)]
+    return fallback?.href ?? null
   }
 
   applySettings(settings: ViewerSettings): void {
@@ -483,7 +671,14 @@ export class EpubViewerEngine {
     const normalized = target.startsWith('epubcfi(')
       ? collapseCfiString(target, true)
       : this.resolveTargetHref(target)
-    await this.rendition.display(normalized)
+    try {
+      await this.rendition.display(normalized)
+    } catch (err) {
+      // A stale fragment (#id) must not block navigation to its section.
+      const sectionOnly = normalized.startsWith('epubcfi(') ? '' : normalized.split('#')[0]
+      if (!sectionOnly || sectionOnly === normalized) throw err
+      await this.rendition.display(sectionOnly)
+    }
   }
 
   async goToPercentage(percentage: number): Promise<void> {
@@ -641,7 +836,9 @@ export class EpubViewerEngine {
     }
     this.rendition = null
     this.book = null
+    this.container?.removeEventListener('scroll', this.handleContainerScroll, { capture: true })
     this.container = null
+    this.touchTap = null
     this.renderedViewMode = null
     this.rebuildPromise = null
     this.locationsReady = false

@@ -49,6 +49,8 @@ export function getStableScrollManager(): any {
     private idleTimer: ReturnType<typeof setTimeout> | null = null
     private heldPrepend = false
     private heldTrim = false
+    private savedOverflowY: string | null = null
+    private flingStopTimer: ReturnType<typeof setTimeout> | null = null
     private touchStart = () => {
       this.touchCount++
       this.lastUserActivityAt = performance.now()
@@ -194,19 +196,34 @@ export function getStableScrollManager(): any {
     }
 
     private adjustScroll(dy: number): void {
+      if (IS_IOS && this.isUserScrolling()) this.stopFling()
+      this.scrollBy(0, dy, true)
+    }
+
+    /**
+     * iOS keeps applying the momentum fling on top of a programmatic scrollTop change, which makes
+     * the view jump. Briefly disabling overflow stops the fling so the correction sticks.
+     * The original overflow value is saved only once: when several corrections land before the
+     * restore runs, a later call must not save (and later restore) 'hidden', which used to leave
+     * the container permanently unscrollable.
+     */
+    private stopFling(): void {
       const container: HTMLElement = this.container
-      if (IS_IOS && this.isUserScrolling()) {
-        // iOS keeps applying the momentum fling on top of a programmatic scrollTop change, which
-        // makes the view jump. Briefly disabling overflow stops the fling so the correction sticks.
-        const prevOverflow = container.style.overflowY
+      if (this.savedOverflowY === null) {
+        this.savedOverflowY = container.style.overflowY
         container.style.overflowY = 'hidden'
-        this.scrollBy(0, dy, true)
-        setTimeout(() => {
-          container.style.overflowY = prevOverflow
-        }, 0)
-      } else {
-        this.scrollBy(0, dy, true)
       }
+      if (this.flingStopTimer) clearTimeout(this.flingStopTimer)
+      this.flingStopTimer = setTimeout(() => this.restoreOverflow(), 0)
+    }
+
+    private restoreOverflow(): void {
+      if (this.flingStopTimer) clearTimeout(this.flingStopTimer)
+      this.flingStopTimer = null
+      if (this.savedOverflowY !== null && this.container) {
+        this.container.style.overflowY = this.savedOverflowY
+      }
+      this.savedOverflowY = null
     }
 
     // ---------------------------------------------------------------- manager overrides
@@ -297,6 +314,7 @@ export function getStableScrollManager(): any {
     destroy(): void {
       if (this.idleTimer) clearTimeout(this.idleTimer)
       this.idleTimer = null
+      this.restoreOverflow()
       this.anchor = null
       super.destroy()
     }
