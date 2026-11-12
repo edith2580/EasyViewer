@@ -74,3 +74,12 @@ body {
   background: rgba(148, 163, 184, 0.75);
 }
 
+
+/*
+ * epub.js continuous (scroll) mode: when a section is prepended above the viewport, epub.js
+ * itself shifts scrollTop by the new section's height. Browser scroll anchoring would apply the
+ * same correction a second time, making the view jump forward while scrolling up across chapters.
+ */
+.epub-container {
+  overflow-anchor: none;
+}

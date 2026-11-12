@@ -63,6 +63,33 @@ export class EpubViewerEngine {
   private sectionMetrics: SpineSectionMetric[] = []
   private activeHighlights: string[] = []
   private cfiHelper = new EpubCFI()
+  private tapHandler: ((clientX: number, clientY: number) => void) | null = null
+  private container: HTMLElement | null = null
+  private onRelocated: ((loc: EpubLocationChange) => void) | null = null
+  // View mode the current rendition was created with (the view manager differs per mode).
+  private renderedViewMode: ViewerSettings['viewMode'] | null = null
+  private rebuildPromise: Promise<void> | null = null
+
+  /**
+   * Registers a callback for plain taps/clicks inside the rendered EPUB iframe.
+   * Coordinates are converted to the parent window's viewport. Taps on links/form controls
+   * and clicks that end a text selection are not forwarded.
+   */
+  setTapHandler(handler: ((clientX: number, clientY: number) => void) | null): void {
+    this.tapHandler = handler
+  }
+
+  private handleContentClick(event: MouseEvent, contents: any): void {
+    if (!this.tapHandler) return
+    const win: Window | null | undefined = contents?.document?.defaultView
+    const selection = win?.getSelection()
+    if (selection && !selection.isCollapsed && selection.toString().trim()) return
+    const target = event.target as Element | null
+    if (target?.closest?.('a[href], button, input, textarea, select, label')) return
+
+    const frameRect = (win?.frameElement as HTMLElement | null)?.getBoundingClientRect()
+    this.tapHandler(event.clientX + (frameRect?.left ?? 0), event.clientY + (frameRect?.top ?? 0))
+  }
 
   async loadBook(
     buffer: ArrayBuffer,
@@ -98,47 +125,9 @@ export class EpubViewerEngine {
     }
     this.buildSectionMetrics()
 
-    const flowMode = settings.viewMode === 'scroll' ? 'scrolled-doc' : 'paginated'
-    const rendition = book.renderTo(container, {
-      width: '100%',
-      height: '100%',
-      flow: flowMode,
-      spread: 'none',
-      allowScriptedContent: false
-    })
-    this.rendition = rendition
-
-    this.applySettings(settings)
-
-    let isFirstRelocation = true
-
-    rendition.on('relocated', (location: any) => {
-      if (!location?.start) return
-      const cfi: string = location.start.cfi || ''
-      const href: string = location.start.href || ''
-      let percentage = this.computeLocationPercentage(location)
-
-      // Preserve saved non-zero percentage on initial reload if the restored locator is non-start
-      if (
-        isFirstRelocation &&
-        initialLocator &&
-        typeof initialPercentage === 'number' &&
-        initialPercentage > 0 &&
-        percentage === 0 &&
-        !location.atStart
-      ) {
-        percentage = Math.min(100, Math.max(0, Math.round(initialPercentage * 10) / 10))
-      }
-      isFirstRelocation = false
-
-      const chapterTitle = this.findChapterLabelByHref(href, location.start.index)
-      onRelocated?.({
-        cfi,
-        percentage,
-        chapterTitle,
-        href
-      })
-    })
+    this.container = container
+    this.onRelocated = onRelocated || null
+    const rendition = this.createRendition(settings, initialLocator, initialPercentage)
 
     if (initialLocator && initialLocator.startsWith('epubcfi(')) {
       const targetCfi = collapseCfiString(initialLocator, true)
@@ -161,6 +150,86 @@ export class EpubViewerEngine {
       title: metadata?.title || '제목 없는 EPUB',
       author: metadata?.creator || '작자 미상',
       toc: this.tocList
+    }
+  }
+
+  /**
+   * Scroll mode uses the 'continuous' view manager so that scrolling flows seamlessly from one
+   * spine section into the next. ('scrolled-doc' shows a single section only, so scrolling
+   * stopped at the end of each chapter — and image-only sections could not be scrolled past.)
+   */
+  private createRendition(
+    settings: ViewerSettings,
+    initialLocator?: string,
+    initialPercentage?: number
+  ): Rendition {
+    if (!this.book || !this.container) throw new Error('EPUB book is not loaded')
+    const isScroll = settings.viewMode === 'scroll'
+    const rendition = this.book.renderTo(this.container, {
+      width: '100%',
+      height: '100%',
+      manager: isScroll ? 'continuous' : 'default',
+      flow: isScroll ? 'scrolled' : 'paginated',
+      spread: 'none',
+      allowScriptedContent: false
+    })
+    this.rendition = rendition
+    this.renderedViewMode = settings.viewMode
+
+    this.applyTheme(settings)
+
+    rendition.on('click', (event: MouseEvent, contents: any) =>
+      this.handleContentClick(event, contents)
+    )
+
+    let isFirstRelocation = Boolean(initialLocator)
+
+    rendition.on('relocated', (location: any) => {
+      if (!location?.start) return
+      const cfi: string = location.start.cfi || ''
+      const href: string = location.start.href || ''
+      let percentage = this.computeLocationPercentage(location)
+
+      // Preserve saved non-zero percentage on initial reload if the restored locator is non-start
+      if (
+        isFirstRelocation &&
+        initialLocator &&
+        typeof initialPercentage === 'number' &&
+        initialPercentage > 0 &&
+        percentage === 0 &&
+        !location.atStart
+      ) {
+        percentage = Math.min(100, Math.max(0, Math.round(initialPercentage * 10) / 10))
+      }
+      isFirstRelocation = false
+
+      const chapterTitle = this.findChapterLabelByHref(href, location.start.index)
+      this.onRelocated?.({
+        cfi,
+        percentage,
+        chapterTitle,
+        href
+      })
+    })
+
+    return rendition
+  }
+
+  /** Re-creates the rendition (e.g. paginated ↔ scroll needs a different view manager), keeping the reading position. */
+  private async rebuildRendition(settings: ViewerSettings): Promise<void> {
+    if (!this.book || !this.container || !this.rendition) return
+    const currentCfi: string | undefined = (this.rendition as any).location?.start?.cfi
+    try {
+      this.rendition.destroy()
+    } catch {
+      // Ignore
+    }
+    this.activeHighlights = []
+    const rendition = this.createRendition(settings)
+    try {
+      await rendition.display(currentCfi ? collapseCfiString(currentCfi, true) : undefined)
+    } catch {
+      await rendition.display()
     }
   }
 
@@ -362,6 +431,20 @@ export class EpubViewerEngine {
 
   applySettings(settings: ViewerSettings): void {
     if (!this.rendition) return
+    if (settings.viewMode !== this.renderedViewMode) {
+      // Serialize rebuilds so rapid toggles don't interleave destroy/display.
+      const prev = this.rebuildPromise || Promise.resolve()
+      this.rebuildPromise = prev
+        .then(() => (settings.viewMode !== this.renderedViewMode ? this.rebuildRendition(settings) : undefined))
+        .catch(() => undefined)
+      return
+    }
+    this.applyTheme(settings)
+    this.rendition.flow(settings.viewMode === 'scroll' ? 'scrolled' : 'paginated')
+  }
+
+  private applyTheme(settings: ViewerSettings): void {
+    if (!this.rendition) return
     const palette = THEME_PALETTE_MAP[settings.theme] || THEME_PALETTE_MAP.light
     const fontStack = FONT_STACK_MAP[settings.fontFamily] || FONT_STACK_MAP.sans
 
@@ -383,9 +466,6 @@ export class EpubViewerEngine {
         color: `${palette.link} !important`
       }
     })
-
-    const targetFlow = settings.viewMode === 'scroll' ? 'scrolled-doc' : 'paginated'
-    this.rendition.flow(targetFlow)
   }
 
   async next(): Promise<void> {
@@ -559,6 +639,9 @@ export class EpubViewerEngine {
     }
     this.rendition = null
     this.book = null
+    this.container = null
+    this.renderedViewMode = null
+    this.rebuildPromise = null
     this.locationsReady = false
     this.sectionMetrics = []
     this.activeHighlights = []

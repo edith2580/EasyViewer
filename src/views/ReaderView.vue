@@ -24,8 +24,6 @@ import {
   BookmarkCheck,
   Search,
   Settings,
-  ChevronLeft,
-  ChevronRight,
   RefreshCw,
   Loader2
 } from 'lucide-vue-next'
@@ -47,6 +45,10 @@ const toastMsg = ref('')
 const drawerOpen = ref(false)
 const drawerTab = ref<DrawerTab>('toc')
 const settingsOpen = ref(false)
+
+// Top/bottom navigation bars overlay the document; a tap in the center toggles them.
+const menuVisible = ref(true)
+const readerCanvasRef = ref<HTMLElement | null>(null)
 
 // Document state
 const tocItems = ref<TocItem[]>([])
@@ -343,6 +345,7 @@ async function loadDocument() {
     await nextTick()
     if (!epubContainerRef.value) return
     epubEngine = new EpubViewerEngine()
+    epubEngine.setTapHandler(handleReaderTap)
     try {
       const info = await epubEngine.loadBook(
         buffer,
@@ -531,6 +534,51 @@ async function nextPage() {
       behavior: 'smooth'
     })
   }
+}
+
+/**
+ * Tap zones (relative to the full reader screen):
+ *   paginated mode            scroll mode
+ *   ┌──────────────────┐      ┌──────────────────┐
+ *   │   top 1/3: menu  │      │                  │
+ *   ├─────┬──────┬─────┤      │                  │
+ *   │prev │ menu │next │      │   anywhere: menu │
+ *   ├─────┴──────┴─────┤      │                  │
+ *   │ bottom 1/3: next │      │                  │
+ *   └──────────────────┘      └──────────────────┘
+ */
+function handleReaderTap(clientX: number, clientY: number) {
+  if (isLoading.value || loadError.value || drawerOpen.value || settingsOpen.value) return
+  const el = readerCanvasRef.value
+  if (!el) return
+  const rect = el.getBoundingClientRect()
+  if (rect.width <= 0 || rect.height <= 0) return
+
+  if (settingsStore.settings.viewMode !== 'paginated') {
+    menuVisible.value = !menuVisible.value
+    return
+  }
+
+  const rx = (clientX - rect.left) / rect.width
+  const ry = (clientY - rect.top) / rect.height
+  if (ry >= 2 / 3) {
+    nextPage()
+  } else if (ry >= 1 / 3 && rx < 1 / 3) {
+    prevPage()
+  } else if (ry >= 1 / 3 && rx > 2 / 3) {
+    nextPage()
+  } else {
+    menuVisible.value = !menuVisible.value
+  }
+}
+
+function handleCanvasClick(e: MouseEvent) {
+  const target = e.target as HTMLElement | null
+  if (target?.closest('a[href], button, input, textarea, select, label')) return
+  // A click that ends a drag-selection must not flip the page.
+  const selection = window.getSelection()
+  if (selection && !selection.isCollapsed && selection.toString().trim()) return
+  handleReaderTap(e.clientX, e.clientY)
 }
 
 async function handleProgressSliderChange(e: Event) {
@@ -778,15 +826,22 @@ onBeforeUnmount(() => {
 
 <template>
   <div
-    class="h-full w-full flex flex-col overflow-hidden"
+    class="relative h-full w-full overflow-hidden"
     :style="{
       backgroundColor: 'var(--ev-reader-bg)',
       color: 'var(--ev-text)'
     }"
   >
-    <!-- Top Reader Navigation Bar -->
+    <!-- Top Reader Navigation Bar (overlays the document; toggled by a center tap) -->
+    <Transition
+      enter-active-class="transition-transform duration-200 ease-out"
+      leave-active-class="transition-transform duration-150 ease-in"
+      enter-from-class="-translate-y-full"
+      leave-to-class="-translate-y-full"
+    >
     <header
-      class="px-3 sm:px-6 border-b flex items-center justify-between gap-2 shrink-0 z-20"
+      v-show="menuVisible"
+      class="absolute top-0 inset-x-0 px-3 sm:px-6 border-b shadow-sm flex items-center justify-between gap-2 z-20"
       :style="{
         paddingTop: 'env(safe-area-inset-top, 0px)',
         minHeight: 'calc(env(safe-area-inset-top, 0px) + 3.5rem)',
@@ -878,9 +933,18 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </header>
+    </Transition>
 
-    <!-- Main Document Canvas -->
-    <div class="relative flex-1 overflow-hidden flex flex-col">
+    <!-- Main Document Canvas (full screen; tap zones are resolved from click coordinates) -->
+    <div
+      ref="readerCanvasRef"
+      class="absolute inset-0 z-0 overflow-hidden flex flex-col"
+      :style="{
+        paddingTop: 'env(safe-area-inset-top, 0px)',
+        paddingBottom: 'env(safe-area-inset-bottom, 0px)'
+      }"
+      @click="handleCanvasClick"
+    >
       <!-- Loading Overlay -->
       <div
         v-if="isLoading"
@@ -910,35 +974,6 @@ onBeforeUnmount(() => {
       <template v-else-if="currentBook?.format === 'epub'">
         <div class="relative flex-1 w-full h-full overflow-hidden">
           <div ref="epubContainerRef" class="w-full h-full" />
-
-          <!-- Left / Right Page Flip Buttons in Paginated Mode -->
-          <template v-if="settingsStore.settings.viewMode === 'paginated'">
-            <button
-              type="button"
-              class="absolute left-2 top-1/2 -translate-y-1/2 z-10 p-2.5 rounded-full border shadow-md opacity-40 hover:opacity-100 transition-opacity"
-              :style="{
-                backgroundColor: 'var(--ev-surface)',
-                borderColor: 'var(--ev-border)'
-              }"
-              title="이전 페이지 (←)"
-              @click="prevPage"
-            >
-              <ChevronLeft class="w-5 h-5" />
-            </button>
-
-            <button
-              type="button"
-              class="absolute right-2 top-1/2 -translate-y-1/2 z-10 p-2.5 rounded-full border shadow-md opacity-40 hover:opacity-100 transition-opacity"
-              :style="{
-                backgroundColor: 'var(--ev-surface)',
-                borderColor: 'var(--ev-border)'
-              }"
-              title="다음 페이지 (→)"
-              @click="nextPage"
-            >
-              <ChevronRight class="w-5 h-5" />
-            </button>
-          </template>
         </div>
       </template>
 
@@ -1009,42 +1044,20 @@ onBeforeUnmount(() => {
               </p>
             </template>
           </div>
-
-          <!-- Left / Right Floating Page Flip Buttons -->
-          <button
-            type="button"
-            :disabled="txtCurrentPageIdx <= 0"
-            class="absolute left-3 top-1/2 -translate-y-1/2 z-10 p-2.5 rounded-full border shadow-md opacity-50 hover:opacity-100 disabled:opacity-15 transition-opacity"
-            :style="{
-              backgroundColor: 'var(--ev-surface)',
-              borderColor: 'var(--ev-border)'
-            }"
-            title="이전 페이지 (←)"
-            @click="prevPage"
-          >
-            <ChevronLeft class="w-5 h-5" />
-          </button>
-
-          <button
-            type="button"
-            :disabled="txtCurrentPageIdx >= txtPages.length - 1"
-            class="absolute right-3 top-1/2 -translate-y-1/2 z-10 p-2.5 rounded-full border shadow-md opacity-50 hover:opacity-100 disabled:opacity-15 transition-opacity"
-            :style="{
-              backgroundColor: 'var(--ev-surface)',
-              borderColor: 'var(--ev-border)'
-            }"
-            title="다음 페이지 (→)"
-            @click="nextPage"
-          >
-            <ChevronRight class="w-5 h-5" />
-          </button>
         </div>
       </template>
     </div>
 
-    <!-- Bottom Progress Bar -->
+    <!-- Bottom Progress Bar (overlays the document; toggled by a center tap) -->
+    <Transition
+      enter-active-class="transition-transform duration-200 ease-out"
+      leave-active-class="transition-transform duration-150 ease-in"
+      enter-from-class="translate-y-full"
+      leave-to-class="translate-y-full"
+    >
     <footer
-      class="px-4 sm:px-6 border-t flex items-center justify-between gap-4 text-xs shrink-0 z-20"
+      v-show="menuVisible"
+      class="absolute bottom-0 inset-x-0 px-4 sm:px-6 border-t shadow-sm flex items-center justify-between gap-4 text-xs z-20"
       :style="{
         paddingBottom: 'env(safe-area-inset-bottom, 0px)',
         height: 'calc(env(safe-area-inset-bottom, 0px) + 3rem)',
@@ -1089,6 +1102,7 @@ onBeforeUnmount(() => {
         </span>
       </div>
     </footer>
+    </Transition>
 
     <!-- Side Drawer (TOC / Bookmarks / Unified Search) -->
     <ViewerSideDrawer
