@@ -1,5 +1,6 @@
 import ePub, { EpubCFI, type Book, type NavItem, type Rendition } from 'epubjs'
 import type { SearchResultItem, TocItem, ViewerSettings } from '@/types'
+import { getStableScrollManager } from './stableScrollManager'
 
 export interface EpubLocationChange {
   cfi: string
@@ -154,9 +155,10 @@ export class EpubViewerEngine {
   }
 
   /**
-   * Scroll mode uses the 'continuous' view manager so that scrolling flows seamlessly from one
+   * Scroll mode uses a 'continuous' view manager so that scrolling flows seamlessly from one
    * spine section into the next. ('scrolled-doc' shows a single section only, so scrolling
    * stopped at the end of each chapter — and image-only sections could not be scrolled past.)
+   * See stableScrollManager.ts for how it keeps the position steady while sections load above.
    */
   private createRendition(
     settings: ViewerSettings,
@@ -168,7 +170,7 @@ export class EpubViewerEngine {
     const rendition = this.book.renderTo(this.container, {
       width: '100%',
       height: '100%',
-      manager: isScroll ? 'continuous' : 'default',
+      manager: isScroll ? getStableScrollManager() : 'default',
       flow: isScroll ? 'scrolled' : 'paginated',
       spread: 'none',
       allowScriptedContent: false
