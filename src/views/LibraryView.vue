@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useBookStore } from '@/stores/useBookStore'
 import { useSettingsStore } from '@/stores/useSettingsStore'
-import { isTauriEnv } from '@/services/storage/platformAdapter'
+import { isDesktopApp, isTauriEnv, platformStorage } from '@/services/storage/platformAdapter'
 import type { BookFormat, BookMeta } from '@/types'
 import NetworkDownloadModal from '@/components/library/NetworkDownloadModal.vue'
 import SyncModal from '@/components/library/SyncModal.vue'
@@ -19,7 +19,10 @@ import {
   Coffee,
   Search,
   Sparkles,
-  CheckCircle2
+  CheckCircle2,
+  FolderOpen,
+  FolderCog,
+  RotateCcw
 } from 'lucide-vue-next'
 
 const router = useRouter()
@@ -36,9 +39,89 @@ const showDownloadModal = ref(false)
 const showSyncModal = ref(false)
 const toastMessage = ref('')
 
+// Storage folder (Windows/macOS app only)
+const isDesktop = ref(false)
+const showStoragePanel = ref(false)
+const storageDir = ref('')
+const storageIsCustom = ref(false)
+
+async function refreshStorageDir() {
+  storageDir.value = await platformStorage.getStorageDir()
+  storageIsCustom.value = await platformStorage.isCustomStorageDir()
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+async function openStorageFolder() {
+  try {
+    await platformStorage.openStorageDir()
+  } catch (err) {
+    showToast(`폴더를 열 수 없습니다: ${errorText(err)}`)
+  }
+}
+
+async function changeStorageFolder() {
+  try {
+    const { open } = await import('@tauri-apps/plugin-dialog')
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      defaultPath: storageDir.value || undefined,
+      title: '소설 저장 폴더 선택'
+    })
+    if (!picked || Array.isArray(picked)) return
+    await platformStorage.setStorageDir(picked)
+    await refreshStorageDir()
+    showToast('저장 폴더를 변경했습니다. 이제부터 추가하는 책이 이 폴더에 저장됩니다.')
+  } catch (err) {
+    showToast(`저장 폴더를 변경할 수 없습니다: ${errorText(err)}`)
+  }
+}
+
+async function resetStorageFolder() {
+  try {
+    await platformStorage.setStorageDir(null)
+    await refreshStorageDir()
+    showToast('기본 저장 폴더로 되돌렸습니다.')
+  } catch (err) {
+    showToast(`기본 폴더로 되돌릴 수 없습니다: ${errorText(err)}`)
+  }
+}
+
+/** Trash button: removes the book from the library (and its file, if that option is on). */
+async function handleRemoveBook(book: BookMeta) {
+  const deleteFile = await bookStore.willDeleteFileOnRemove(book.id)
+  if (isDesktop.value && deleteFile) {
+    // The file is permanently deleted from a user-visible folder: confirm first.
+    try {
+      const { ask } = await import('@tauri-apps/plugin-dialog')
+      const ok = await ask(
+        `'${book.title}'을(를) 서재에서 삭제하고 저장 폴더의 파일도 삭제합니다.\n삭제한 파일은 되돌릴 수 없습니다.`,
+        { title: '책 삭제', kind: 'warning', okLabel: '삭제', cancelLabel: '취소' }
+      )
+      if (!ok) return
+    } catch {
+      return
+    }
+  }
+  const fileDeleted = await bookStore.removeBook(book.id)
+  if (isDesktop.value) {
+    showToast(
+      fileDeleted
+        ? '서재에서 삭제하고 파일도 삭제했습니다.'
+        : '서재에서 삭제했습니다. 파일은 저장 폴더에 남아 있습니다.'
+    )
+  }
+}
+
 onMounted(async () => {
   await settingsStore.initSettings()
   await bookStore.initLibrary()
+
+  isDesktop.value = await isDesktopApp()
+  if (isDesktop.value) await refreshStorageDir()
 
   window.addEventListener('dragenter', handleWindowDragEnter)
   window.addEventListener('dragover', handleWindowDragOver)
@@ -174,7 +257,8 @@ async function processDroppedPaths(paths: string[]) {
       if (!lower.endsWith('.txt') && !lower.endsWith('.epub')) continue
       const bytes = await readFile(fullPath)
       const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
-      await bookStore.addBookFromBuffer(buffer, fileName)
+      // Passing the path lets a file that already is in the storage folder be used in place.
+      await bookStore.addBookFromBuffer(buffer, fileName, undefined, undefined, fullPath)
       added++
     }
   } catch (err) {
@@ -276,6 +360,99 @@ function formatFileSize(bytes: number): string {
           <Download class="w-4 h-4 text-indigo-500" />
           <span>다운로드</span>
         </button>
+
+        <!-- Storage folder: open in Explorer/Finder or change it (desktop app only) -->
+        <div v-if="isDesktop" class="relative">
+          <button
+            type="button"
+            class="flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-semibold hover:border-indigo-500 transition-all"
+            :style="{ borderColor: showStoragePanel ? '#6366f1' : 'var(--ev-border)' }"
+            title="소설 저장 폴더"
+            :aria-expanded="showStoragePanel"
+            @click="showStoragePanel = !showStoragePanel"
+          >
+            <FolderOpen class="w-4 h-4 text-indigo-500" />
+            <span>저장 폴더</span>
+          </button>
+
+          <template v-if="showStoragePanel">
+            <div class="fixed inset-0 z-30" @click="showStoragePanel = false" />
+            <div
+              class="absolute right-0 top-full mt-2 z-40 w-80 max-w-[calc(100vw-2rem)] p-4 rounded-2xl border shadow-xl"
+              :style="{ backgroundColor: 'var(--ev-surface)', borderColor: 'var(--ev-border)' }"
+            >
+              <p class="text-xs font-bold mb-1.5">
+                소설 저장 폴더
+                <span
+                  class="ml-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-black/5 dark:bg-white/10 opacity-70"
+                >
+                  {{ storageIsCustom ? '사용자 지정' : '기본' }}
+                </span>
+              </p>
+              <p
+                class="text-[11px] font-mono break-all leading-relaxed px-2.5 py-2 rounded-lg bg-black/5 dark:bg-white/5 select-text"
+                :title="storageDir"
+              >
+                {{ storageDir }}
+              </p>
+
+              <div class="mt-3 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  class="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition-all"
+                  @click="openStorageFolder"
+                >
+                  <FolderOpen class="w-4 h-4" />
+                  <span>폴더 열기</span>
+                </button>
+                <button
+                  type="button"
+                  class="flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-semibold hover:border-indigo-500 transition-all"
+                  :style="{ borderColor: 'var(--ev-border)' }"
+                  @click="changeStorageFolder"
+                >
+                  <FolderCog class="w-4 h-4 text-indigo-500" />
+                  <span>폴더 변경</span>
+                </button>
+                <button
+                  v-if="storageIsCustom"
+                  type="button"
+                  class="flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-semibold hover:border-indigo-500 transition-all"
+                  :style="{ borderColor: 'var(--ev-border)' }"
+                  @click="resetStorageFolder"
+                >
+                  <RotateCcw class="w-4 h-4 opacity-70" />
+                  <span>기본 폴더로</span>
+                </button>
+              </div>
+
+              <p class="mt-3 text-[11px] leading-relaxed opacity-60">
+                폴더를 변경하면 이후 추가하는 책부터 새 폴더에 저장됩니다. 이미 추가한 책은 원래
+                폴더에 그대로 남아 있습니다.
+              </p>
+
+              <label
+                class="mt-3 pt-3 border-t flex items-start gap-2.5 cursor-pointer select-none"
+                :style="{ borderColor: 'var(--ev-border)' }"
+              >
+                <input
+                  type="checkbox"
+                  class="mt-0.5 w-4 h-4 shrink-0 accent-indigo-600 cursor-pointer"
+                  :checked="bookStore.deleteFileOnRemove"
+                  @change="
+                    bookStore.setDeleteFileOnRemove(($event.target as HTMLInputElement).checked)
+                  "
+                />
+                <span class="text-xs leading-relaxed">
+                  <span class="font-semibold">서재에서 삭제할 때 파일도 삭제</span>
+                  <span class="block text-[11px] opacity-60">
+                    끄면 서재 목록에서만 빠지고 파일은 저장 폴더에 남습니다.
+                  </span>
+                </span>
+              </label>
+            </div>
+          </template>
+        </div>
 
         <button
           v-show="false"
@@ -408,8 +585,14 @@ function formatFileSize(bytes: number): string {
               <button
                 type="button"
                 class="p-1.5 rounded-lg opacity-0 group-hover:opacity-70 hover:!opacity-100 hover:bg-red-500/10 hover:text-red-500 transition-all"
-                title="서재에서 삭제"
-                @click.stop="bookStore.removeBook(book.id)"
+                :title="
+                  isDesktop && book.storedPath
+                    ? bookStore.deleteFileOnRemove
+                      ? '서재에서 삭제 (파일도 삭제)'
+                      : '서재에서 삭제 (파일은 유지)'
+                    : '서재에서 삭제'
+                "
+                @click.stop="handleRemoveBook(book)"
               >
                 <Trash2 class="w-4 h-4" />
               </button>

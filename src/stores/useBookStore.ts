@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import type { BookFormat, BookMeta, BookmarkItem, ReadingLocation, SyncPayload } from '@/types'
-import { platformStorage } from '@/services/storage/platformAdapter'
+import { isDesktopApp, platformStorage } from '@/services/storage/platformAdapter'
 import { extractEpubMetadata } from '@/engines/epub/epubEngine'
 import { createSampleEpubBook, createSampleTxtBook } from '@/services/sampleBooks'
 import { downloadRemoteBook, type DownloadProgress } from '@/services/network/downloadService'
@@ -12,6 +12,7 @@ const BOOKS_META_KEY = 'library_books_v1'
 const POSITIONS_KEY = 'reading_positions_v1'
 const BOOKMARKS_KEY = 'bookmarks_v1'
 const SAMPLES_SEEDED_KEY = 'samples_seeded_v1'
+const DELETE_FILE_ON_REMOVE_KEY = 'delete_file_on_remove_v1'
 
 /**
  * Generates a deterministic fingerprint ID from file name and byte size / head bytes
@@ -32,6 +33,13 @@ async function computeBookHash(name: string, buffer: ArrayBuffer): Promise<strin
   return `book-${(hash >>> 0).toString(16)}-${buffer.byteLength}`
 }
 
+/** File name for a book imported before original names were kept (rebuilt from its metadata). */
+function legacyFileName(book: BookMeta): string {
+  const hasAuthor = book.format === 'txt' && book.author && book.author !== 'TXT 문서'
+  const base = hasAuthor ? `${book.title} - ${book.author}` : book.title
+  return `${base}.${book.format}`
+}
+
 export const useBookStore = defineStore('books', () => {
   const books = ref<BookMeta[]>([])
   const positions = ref<Record<string, ReadingLocation>>({})
@@ -40,6 +48,12 @@ export const useBookStore = defineStore('books', () => {
   const isSyncing = ref(false)
   const lastSyncTime = ref<number | null>(null)
   const syncStatusMessage = ref<string>('')
+  /**
+   * Desktop app: also delete the book's file from the storage folder when it is removed from
+   * the library. Off by default (the folder is user-visible and may hold the user's own files).
+   * On mobile/web book files are internal app storage and are always deleted.
+   */
+  const deleteFileOnRemove = ref(false)
 
   const sortedBooks = computed(() =>
     [...books.value].sort((a, b) => (b.lastOpenedAt || b.addedAt) - (a.lastOpenedAt || a.addedAt))
@@ -49,7 +63,10 @@ export const useBookStore = defineStore('books', () => {
     if (isInitialized.value) return
     books.value = await platformStorage.getItem<BookMeta[]>(BOOKS_META_KEY, [])
     positions.value = await platformStorage.getItem<Record<string, ReadingLocation>>(POSITIONS_KEY, {})
+    deleteFileOnRemove.value = await platformStorage.getItem<boolean>(DELETE_FILE_ON_REMOVE_KEY, false)
     bookmarks.value = await platformStorage.getItem<Record<string, BookmarkItem[]>>(BOOKMARKS_KEY, {})
+
+    await prepareBookFiles()
 
     const seeded = await platformStorage.getItem<boolean>(SAMPLES_SEEDED_KEY, false)
     if (!seeded && books.value.length === 0) {
@@ -73,6 +90,41 @@ export const useBookStore = defineStore('books', () => {
     await platformStorage.setItem(BOOKMARKS_KEY, bookmarks.value)
   }
 
+  /**
+   * App only: re-allows every folder that holds library books (a storage folder chosen earlier
+   * may be outside the app data directory) and renames books stored the old way
+   * (`books/<id>.bin`) to their readable file names.
+   */
+  async function prepareBookFiles() {
+    // Desktop only: Android/iOS keep the internal `books/<id>.bin` files as they are.
+    if (!(await isDesktopApp())) return
+    const { dirname } = await import('@tauri-apps/api/path')
+    const dirs: string[] = [await platformStorage.getStorageDir()]
+    for (const book of books.value) {
+      if (book.storedPath) {
+        try {
+          dirs.push(await dirname(book.storedPath))
+        } catch {
+          // Ignore malformed paths
+        }
+      }
+    }
+    await platformStorage.allowStorageDirs(dirs)
+
+    let migrated = false
+    for (const book of books.value) {
+      if (book.storedPath) continue
+      const fileName = book.fileName || legacyFileName(book)
+      const newPath = await platformStorage.migrateLegacyBookFile(book.id, fileName)
+      if (newPath) {
+        book.storedPath = newPath
+        book.fileName = fileName
+        migrated = true
+      }
+    }
+    if (migrated) await platformStorage.setItem(BOOKS_META_KEY, books.value)
+  }
+
   async function seedSampleBooks() {
     const epubBuffer = await createSampleEpubBook()
     await addBookFromBuffer(epubBuffer, 'EasyViewer 완벽 가이드 및 샘플 북.epub', 'epub')
@@ -85,14 +137,24 @@ export const useBookStore = defineStore('books', () => {
     buffer: ArrayBuffer,
     filename: string,
     explicitFormat?: BookFormat,
-    sourceUrl?: string
+    sourceUrl?: string,
+    /** Where the file is on disk, when known (drag & drop in the app). */
+    sourcePath?: string
   ): Promise<BookMeta> {
     const lower = filename.toLowerCase()
     const format: BookFormat =
       explicitFormat || (lower.endsWith('.epub') ? 'epub' : 'txt')
 
     const id = await computeBookHash(filename, buffer)
-    await platformStorage.saveBookBinary(id, buffer)
+    const fileName = /\.(epub|txt)$/i.test(filename) ? filename : `${filename}.${format}`
+    const previous = books.value.find((b) => b.id === id)
+    const storedPath = await platformStorage.saveBookFile(
+      id,
+      fileName,
+      buffer,
+      previous?.storedPath,
+      sourcePath
+    )
 
     let title = filename.replace(/\.(epub|txt)$/i, '')
     let author = format === 'epub' ? 'EPUB 문서' : 'TXT 문서'
@@ -124,6 +186,8 @@ export const useBookStore = defineStore('books', () => {
       coverUrl,
       sourceUrl,
       isOfflineCached: true,
+      fileName,
+      storedPath,
       addedAt: existingIdx >= 0 ? books.value[existingIdx].addedAt : now,
       lastOpenedAt: now,
       lastLocation: positions.value[id]
@@ -152,10 +216,26 @@ export const useBookStore = defineStore('books', () => {
     )
   }
 
-  async function removeBook(bookId: string) {
+  /** Whether removing this book from the library also deletes its file on disk. */
+  async function willDeleteFileOnRemove(bookId: string): Promise<boolean> {
+    const storedPath = books.value.find((b) => b.id === bookId)?.storedPath
+    if (!storedPath || !(await isDesktopApp())) return true
+    return deleteFileOnRemove.value
+  }
+
+  /** Removes a book from the library; returns whether its file was deleted too. */
+  async function removeBook(bookId: string): Promise<boolean> {
+    const storedPath = books.value.find((b) => b.id === bookId)?.storedPath
+    const deleteFile = await willDeleteFileOnRemove(bookId)
     books.value = books.value.filter((b) => b.id !== bookId)
-    await platformStorage.removeBookBinary(bookId)
+    if (deleteFile) await platformStorage.removeBookBinary(bookId, storedPath)
     await persistAll()
+    return deleteFile
+  }
+
+  async function setDeleteFileOnRemove(value: boolean) {
+    deleteFileOnRemove.value = value
+    await platformStorage.setItem(DELETE_FILE_ON_REMOVE_KEY, value)
   }
 
   let cachedDeviceId: string | null = null
@@ -320,6 +400,9 @@ export const useBookStore = defineStore('books', () => {
     isSyncing,
     lastSyncTime,
     syncStatusMessage,
+    deleteFileOnRemove,
+    setDeleteFileOnRemove,
+    willDeleteFileOnRemove,
     initLibrary,
     seedSampleBooks,
     addBookFromBuffer,

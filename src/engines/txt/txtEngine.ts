@@ -8,9 +8,17 @@ export interface TxtParagraph {
   isHeading: boolean
 }
 
+/**
+ * A paragraph (or the part of one) shown on a page. `text`/offsets cover only the shown part;
+ * `continued` is true when the paragraph started on a previous page.
+ */
+export interface TxtPageFragment extends TxtParagraph {
+  continued: boolean
+}
+
 export interface TxtPage {
   pageNumber: number
-  paragraphs: TxtParagraph[]
+  paragraphs: TxtPageFragment[]
   startOffset: number
   endOffset: number
   percentage: number
@@ -119,7 +127,8 @@ export function parseTxtDocument(rawText: string): {
 }
 
 /**
- * Computes discrete pages for Horizontal Paginated Mode in TXT Viewer
+ * Estimates pages for Horizontal Paginated Mode from character counts. Only a fallback for when
+ * the page can't be measured (see paginateTxtByLayout); the estimate can overflow a page.
  */
 export function paginateTxtDocument(
   paragraphs: TxtParagraph[],
@@ -133,7 +142,7 @@ export function paginateTxtDocument(
   const approxCharsPerLine = Math.max(15, Math.floor(usableWidth / (config.fontSize * 0.92)))
 
   const pages: TxtPage[] = []
-  let currentParagraphs: TxtParagraph[] = []
+  let currentParagraphs: TxtPageFragment[] = []
   let currentLines = 0
 
   for (const para of paragraphs) {
@@ -153,10 +162,10 @@ export function paginateTxtDocument(
         endOffset,
         percentage: Math.min(100, Math.round((endOffset / totalLength) * 1000) / 10)
       })
-      currentParagraphs = [para]
+      currentParagraphs = [{ ...para, continued: false }]
       currentLines = paraLines
     } else {
-      currentParagraphs.push(para)
+      currentParagraphs.push({ ...para, continued: false })
       currentLines += paraLines
     }
   }

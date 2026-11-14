@@ -11,9 +11,16 @@ import {
   parseOffsetLocator,
   parseTxtDocument,
   searchTxtDocument,
-  type TxtPage,
   type TxtParagraph
 } from '@/engines/txt/txtEngine'
+import {
+  distinctChars,
+  preloadFontsForText,
+  TxtPaginationSession,
+  type TxtPaginationState,
+  TXT_PAGE_HEADING_CLASS,
+  TXT_PAGE_PARA_CLASS
+} from '@/engines/txt/txtMeasuredPagination'
 import type { BookmarkItem, SearchResultItem, TocItem } from '@/types'
 import ViewerSettingsPanel from '@/components/viewer/ViewerSettingsPanel.vue'
 import ViewerSideDrawer, { type DrawerTab } from '@/components/viewer/ViewerSideDrawer.vue'
@@ -72,8 +79,19 @@ const txtParagraphs = shallowRef<TxtParagraph[]>([])
 const txtTotalLength = ref(1)
 const txtScrollContainerRef = ref<HTMLElement | null>(null)
 const txtPaginatedViewportRef = ref<HTMLElement | null>(null)
-const txtPages = shallowRef<TxtPage[]>([])
-const txtCurrentPageIdx = ref(0)
+// The element that holds one page of text; pagination measures layout inside it.
+const txtPageContentRef = ref<HTMLElement | null>(null)
+// Paginated TXT: the reading session (page measuring + background page index) and its state.
+let txtSession: TxtPaginationSession | null = null
+const txtPageState = shallowRef<TxtPaginationState>({
+  page: null,
+  pageNumber: null,
+  totalPages: null,
+  progress: 0,
+  hasPrev: false,
+  hasNext: false
+})
+const txtCurrentPage = computed(() => txtPageState.value.page)
 const viewportSize = ref({ width: 900, height: 680 })
 
 // Virtual Scroll state for TXT vertical scroll mode
@@ -326,7 +344,7 @@ async function loadDocument() {
     return
   }
 
-  const buffer = await platformStorage.loadBookBinary(book.id)
+  const buffer = await platformStorage.loadBookBinary(book.id, book.storedPath)
   if (!buffer) {
     loadError.value = '문서 원본 데이터가 로컬 캐시에 존재하지 않습니다.'
     isLoading.value = false
@@ -397,27 +415,94 @@ function updateViewportMeasurements() {
   }
 }
 
+// Incremented on every (re)pagination so a stale font preload can't touch a newer session.
+let txtPaginationGen = 0
+let txtCharsCache: { paragraphs: TxtParagraph[]; chars: string } | null = null
+
+function txtBookChars(): string {
+  if (txtCharsCache?.paragraphs !== txtParagraphs.value) {
+    txtCharsCache = { paragraphs: txtParagraphs.value, chars: distinctChars(txtParagraphs.value) }
+  }
+  return txtCharsCache.chars
+}
+
+function createTxtSession(targetCharOffset: number, deferBackground: boolean) {
+  const pageEl = txtPageContentRef.value
+  if (!pageEl) return null
+  return new TxtPaginationSession(
+    txtParagraphs.value,
+    txtTotalLength.value,
+    pageEl,
+    targetCharOffset,
+    (state) => {
+      txtPageState.value = state
+    },
+    // Used only if the page element can't be measured (no size yet).
+    () =>
+      paginateTxtDocument(txtParagraphs.value, txtTotalLength.value, {
+        containerWidth: viewportSize.value.width,
+        containerHeight: viewportSize.value.height,
+        fontSize: settingsStore.settings.fontSize,
+        lineHeight: settingsStore.settings.lineHeight,
+        pageMargin: settingsStore.settings.pageMargin
+      }),
+    { deferBackground }
+  )
+}
+
+/**
+ * (Re)starts paginated TXT reading at `targetCharOffset`: the page there is measured and shown
+ * immediately, the full page index is built in the background (see TxtPaginationSession).
+ *
+ * Web fonts (Noto Sans KR is split into many unicode-range files) are loaded for every
+ * character of the book first, and the background index waits for them: measuring while font
+ * files keep arriving would change line breaks under it. If new fonts did arrive, the page on
+ * screen is re-measured once.
+ */
 function recalculateTxtPages(targetCharOffset = 0) {
   if (currentBook.value?.format !== 'txt') return
-  txtPages.value = paginateTxtDocument(txtParagraphs.value, txtTotalLength.value, {
-    containerWidth: viewportSize.value.width,
-    containerHeight: viewportSize.value.height,
-    fontSize: settingsStore.settings.fontSize,
-    lineHeight: settingsStore.settings.lineHeight,
-    pageMargin: settingsStore.settings.pageMargin
-  })
-
-  // Find page containing targetCharOffset
-  const foundIdx = txtPages.value.findIndex(
-    (p) => targetCharOffset >= p.startOffset && targetCharOffset <= p.endOffset
+  txtSession?.destroy()
+  txtSession = null
+  const gen = ++txtPaginationGen
+  const fontsReady = preloadFontsForText(
+    fontFamilyCss.value,
+    settingsStore.settings.fontSize,
+    txtBookChars()
   )
-  txtCurrentPageIdx.value = foundIdx >= 0 ? foundIdx : 0
+  txtSession = createTxtSession(targetCharOffset, true)
   syncTxtPaginatedLocation()
+
+  void fontsReady.then((fontsChanged) => {
+    if (gen !== txtPaginationGen || !txtSession) return
+    if (!fontsChanged) {
+      txtSession.startBackground()
+      return
+    }
+    const start = txtSession.currentStartOffset ?? targetCharOffset
+    txtSession.destroy()
+    txtSession = createTxtSession(start, false)
+    syncTxtPaginatedLocation()
+  })
+}
+
+/** Shows the page containing `offset` (TOC, bookmarks, search, slider, sync). */
+function goToTxtPageOffset(offset: number) {
+  if (!txtSession) {
+    recalculateTxtPages(offset)
+    return
+  }
+  txtSession.goToOffset(offset)
+  syncTxtPaginatedLocation()
+}
+
+function destroyTxtSession() {
+  txtSession?.destroy()
+  txtSession = null
 }
 
 function syncTxtPaginatedLocation() {
   if (currentBook.value?.format !== 'txt' || settingsStore.settings.viewMode !== 'paginated') return
-  const page = txtPages.value[txtCurrentPageIdx.value]
+  const page = txtCurrentPage.value
   if (!page) return
 
   const locator = `offset:${page.startOffset}`
@@ -505,10 +590,7 @@ async function prevPage() {
   }
 
   if (settingsStore.settings.viewMode === 'paginated') {
-    if (txtCurrentPageIdx.value > 0) {
-      txtCurrentPageIdx.value--
-      syncTxtPaginatedLocation()
-    }
+    if (txtSession?.prev()) syncTxtPaginatedLocation()
   } else if (txtScrollContainerRef.value) {
     txtScrollContainerRef.value.scrollBy({
       top: -txtScrollContainerRef.value.clientHeight * 0.85,
@@ -524,10 +606,7 @@ async function nextPage() {
   }
 
   if (settingsStore.settings.viewMode === 'paginated') {
-    if (txtCurrentPageIdx.value < txtPages.value.length - 1) {
-      txtCurrentPageIdx.value++
-      syncTxtPaginatedLocation()
-    }
+    if (txtSession?.next()) syncTxtPaginatedLocation()
   } else if (txtScrollContainerRef.value) {
     txtScrollContainerRef.value.scrollBy({
       top: txtScrollContainerRef.value.clientHeight * 0.85,
@@ -590,12 +669,7 @@ async function handleProgressSliderChange(e: Event) {
   } else {
     const targetOffset = Math.round((pct / 100) * txtTotalLength.value)
     if (settingsStore.settings.viewMode === 'paginated') {
-      const idx = Math.min(
-        txtPages.value.length - 1,
-        Math.max(0, Math.floor((pct / 100) * txtPages.value.length))
-      )
-      txtCurrentPageIdx.value = idx
-      syncTxtPaginatedLocation()
+      goToTxtPageOffset(targetOffset)
     } else {
       await scrollToTxtOffset(targetOffset)
     }
@@ -614,7 +688,7 @@ async function handleSelectToc(item: TocItem) {
   } else {
     const offset = parseOffsetLocator(item.href)
     if (settingsStore.settings.viewMode === 'paginated') {
-      recalculateTxtPages(offset)
+      goToTxtPageOffset(offset)
     } else {
       await scrollToTxtOffset(offset)
     }
@@ -662,7 +736,7 @@ async function handleSelectBookmark(bm: BookmarkItem) {
   } else {
     const offset = parseOffsetLocator(bm.locator)
     if (settingsStore.settings.viewMode === 'paginated') {
-      recalculateTxtPages(offset)
+      goToTxtPageOffset(offset)
     } else {
       await scrollToTxtOffset(offset)
     }
@@ -697,7 +771,7 @@ async function handleSelectSearchResult(hit: SearchResultItem, query: string) {
     const offset = parseOffsetLocator(hit.locator)
     highlightedParaIndex.value = hit.matchIndex ?? null
     if (settingsStore.settings.viewMode === 'paginated') {
-      recalculateTxtPages(offset)
+      goToTxtPageOffset(offset)
     } else {
       await scrollToTxtOffset(offset)
       await nextTick()
@@ -718,7 +792,7 @@ async function handleQuickSync() {
     } else {
       const offset = parseOffsetLocator(syncedLoc.locator)
       if (settingsStore.settings.viewMode === 'paginated') {
-        recalculateTxtPages(offset)
+        goToTxtPageOffset(offset)
       } else {
         await scrollToTxtOffset(offset)
       }
@@ -766,6 +840,7 @@ function scheduleTxtLayoutUpdate(targetOffset: number) {
     if (settingsStore.settings.viewMode === 'paginated') {
       recalculateTxtPages(targetOffset)
     } else {
+      destroyTxtSession()
       recalculateTxtVirtualMetrics()
       await scrollToTxtOffset(targetOffset)
     }
@@ -820,6 +895,7 @@ onBeforeUnmount(() => {
   }
   window.removeEventListener('keydown', handleKeydown)
   window.removeEventListener('resize', handleResize)
+  destroyTxtSession()
   epubEngine?.destroy()
 })
 </script>
@@ -1021,6 +1097,7 @@ onBeforeUnmount(() => {
           class="relative flex-1 flex flex-col justify-between overflow-hidden select-text"
         >
           <div
+            ref="txtPageContentRef"
             class="flex-1 max-w-4xl w-full mx-auto py-6 overflow-hidden"
             :style="{
               fontFamily: fontFamilyCss,
@@ -1030,15 +1107,19 @@ onBeforeUnmount(() => {
               paddingRight: `${settingsStore.settings.pageMargin}px`
             }"
           >
-            <template v-if="txtPages[txtCurrentPageIdx]">
+            <template v-if="txtCurrentPage">
+              <!-- Layout classes must match the pagination measurer (TXT_PAGE_*_CLASS);
+                   highlight uses a ring, not padding, so it can't change line breaks. -->
               <p
-                v-for="para in txtPages[txtCurrentPageIdx].paragraphs"
+                v-for="para in txtCurrentPage.paragraphs"
                 :key="para.index"
-                class="mb-2.5 break-words rounded-md"
+                class="rounded-md"
                 :class="[
-                  para.isHeading ? 'font-bold text-[1.15em] mt-2 mb-2 text-indigo-600 dark:text-indigo-400' : '',
-                  highlightedParaIndex === para.index ? 'bg-amber-400/25 px-2 py-0.5' : ''
+                  TXT_PAGE_PARA_CLASS,
+                  para.isHeading ? `${TXT_PAGE_HEADING_CLASS} text-indigo-600 dark:text-indigo-400` : '',
+                  highlightedParaIndex === para.index ? 'bg-amber-400/25 ring-1 ring-amber-400/60' : ''
                 ]"
+                :style="para.continued ? { marginTop: '0' } : undefined"
               >
                 {{ para.text || '\u00A0' }}
               </p>
@@ -1095,7 +1176,12 @@ onBeforeUnmount(() => {
           v-if="currentBook?.format === 'txt' && settingsStore.settings.viewMode === 'paginated'"
           class="opacity-70"
         >
-          {{ txtCurrentPageIdx + 1 }} / {{ txtPages.length }}p ·
+          <template v-if="txtPageState.totalPages !== null">
+            {{ txtPageState.pageNumber }} / {{ txtPageState.totalPages }}p ·
+          </template>
+          <template v-else>
+            페이지 계산 중 {{ Math.round(txtPageState.progress * 100) }}% ·
+          </template>
         </span>
         <span class="font-bold text-indigo-600 dark:text-indigo-400">
           {{ currentPercentage.toFixed(1) }}%
