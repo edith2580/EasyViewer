@@ -283,6 +283,41 @@ fn user_home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Strips Windows verbatim prefixes (`\\?\UNC\` -> `\\`, `\\?\` -> ``) so paths
+/// from `canonicalize()`, dialogs, drag-drop, and `fs_scope` compare consistently.
+fn normalize_windows_verbatim(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if s.len() >= 8 && s[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{}", &s[8..]));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Canonicalizes an existing path, falling back to `symlink_metadata` + verbatim
+/// normalization on Windows when network shares (SMB/NAS/UNC) reject `GetFinalPathNameByHandleW`.
+fn resolve_existing_path(path: &Path) -> Result<PathBuf, std::io::Error> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => Ok(normalize_windows_verbatim(&canonical)),
+        Err(err) => {
+            #[cfg(windows)]
+            {
+                if let Ok(meta) = std::fs::symlink_metadata(path) {
+                    if !meta.file_type().is_symlink() {
+                        return Ok(normalize_windows_verbatim(path));
+                    }
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
 fn matches_path_prefix(path: &Path, prefix: &Path, case_insensitive: bool) -> bool {
     if !case_insensitive {
         return path.starts_with(prefix);
@@ -382,7 +417,7 @@ pub fn validate_and_prepare_storage_dir(
             format!("SECURITY_DENIED: 유효한 상위 디렉토리를 찾을 수 없습니다: {raw_path}")
         })?;
     }
-    let canonical_ancestor = std::fs::canonicalize(ancestor)
+    let canonical_ancestor = resolve_existing_path(ancestor)
         .map_err(|e| format!("SECURITY_DENIED: 상위 경로 정규화 실패: {e}"))?;
     if is_sensitive_path(&canonical_ancestor, home_dir) {
         return Err(format!(
@@ -392,7 +427,7 @@ pub fn validate_and_prepare_storage_dir(
 
     std::fs::create_dir_all(&dir).map_err(|e| format!("DIR_CREATE_FAILED: {e}"))?;
 
-    let canonical_final = std::fs::canonicalize(&dir)
+    let canonical_final = resolve_existing_path(&dir)
         .map_err(|e| format!("SECURITY_DENIED: 생성된 경로 검증 실패: {e}"))?;
     if !canonical_final.is_dir() {
         return Err(format!("INVALID_DIR: 디렉토리가 아닙니다: {raw_path}"));
@@ -422,7 +457,7 @@ pub fn validate_and_read_book_file(
         return Err("UNSUPPORTED_FORMAT: .txt 또는 .epub 파일만 열 수 있습니다.".into());
     }
 
-    let canonical = std::fs::canonicalize(&raw)
+    let canonical = resolve_existing_path(&raw)
         .map_err(|e| format!("FILE_READ_FAILED: 파일 정보를 확인할 수 없습니다: {e}"))?;
     if is_sensitive_path(&canonical, home_dir) {
         return Err("SECURITY_DENIED: 심볼릭 링크 대상이 보호 경로여서 차단되었습니다.".into());
@@ -431,8 +466,22 @@ pub fn validate_and_read_book_file(
         return Err("UNSUPPORTED_FORMAT: 정규화된 대상이 .txt 또는 .epub 파일이 아닙니다.".into());
     }
 
-    let in_approved_dir = approved_dirs.iter().any(|dir| canonical.starts_with(dir));
-    let in_approved_drop = approved_drops.contains(&canonical);
+    let case_insensitive = cfg!(any(target_os = "macos", target_os = "windows"));
+    let in_approved_dir = approved_dirs.iter().any(|dir| {
+        let norm_dir = normalize_windows_verbatim(dir);
+        matches_path_prefix(&canonical, &norm_dir, case_insensitive)
+    });
+    let in_approved_drop = approved_drops.iter().any(|drop_path| {
+        let norm_drop = normalize_windows_verbatim(drop_path);
+        if case_insensitive {
+            norm_drop
+                .to_string_lossy()
+                .replace('\\', "/")
+                .eq_ignore_ascii_case(&canonical.to_string_lossy().replace('\\', "/"))
+        } else {
+            norm_drop == canonical
+        }
+    });
     if !in_approved_dir && !in_approved_drop && !fs_scope_allowed {
         return Err(
             "SECURITY_DENIED: 승인된 저장소, 파일 다이얼로그 또는 드롭 화이트리스트에 없는 파일입니다."
@@ -492,10 +541,15 @@ fn read_validated_book_file(
     path: String,
     max_bytes: Option<u64>,
 ) -> Result<tauri::ipc::Response, String> {
-    let fs_scope_allowed = validate_storage_dir_path(&path)
-        .ok()
-        .and_then(|p| std::fs::canonicalize(p).ok())
-        .is_some_and(|c| app.fs_scope().is_allowed(&c));
+    let fs_scope_allowed = validate_storage_dir_path(&path).ok().is_some_and(|raw| {
+        app.fs_scope().is_allowed(&raw)
+            || resolve_existing_path(&raw)
+                .ok()
+                .is_some_and(|resolved| app.fs_scope().is_allowed(&resolved))
+            || std::fs::canonicalize(&raw)
+                .ok()
+                .is_some_and(|canon| app.fs_scope().is_allowed(&canon))
+    });
 
     let dirs = state
         .approved_storage_dirs
@@ -693,7 +747,7 @@ pub fn run() {
                 let home = user_home_dir();
                 if let Ok(mut drops) = state.approved_drop_paths.lock() {
                     for p in paths {
-                        if let Ok(canonical) = std::fs::canonicalize(p) {
+                        if let Ok(canonical) = resolve_existing_path(p) {
                             if !is_sensitive_path(&canonical, home.as_deref()) {
                                 drops.insert(canonical);
                             }
@@ -728,7 +782,34 @@ mod tests {
         assert!(validate_storage_dir_path("").is_err());
         assert!(validate_storage_dir_path("relative/folder").is_err());
         assert!(validate_storage_dir_path("/tmp/books/../escape").is_err());
+        #[cfg(windows)]
+        {
+            assert!(validate_storage_dir_path(r"C:\tmp\books").is_ok());
+            assert!(validate_storage_dir_path(r"\\nas\books\novel.txt").is_ok());
+        }
+        #[cfg(not(windows))]
         assert!(validate_storage_dir_path("/tmp/books").is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalizes_windows_verbatim_and_unc_paths() {
+        assert_eq!(
+            normalize_windows_verbatim(Path::new(r"\\?\UNC\nas\share\novel.txt")),
+            PathBuf::from(r"\\nas\share\novel.txt")
+        );
+        assert_eq!(
+            normalize_windows_verbatim(Path::new(r"\\?\unc\192.168.0.10\books\test.epub")),
+            PathBuf::from(r"\\192.168.0.10\books\test.epub")
+        );
+        assert_eq!(
+            normalize_windows_verbatim(Path::new(r"\\?\C:\Users\edith\Books\test.txt")),
+            PathBuf::from(r"C:\Users\edith\Books\test.txt")
+        );
+        assert_eq!(
+            normalize_windows_verbatim(Path::new(r"\\nas\share\novel.txt")),
+            PathBuf::from(r"\\nas\share\novel.txt")
+        );
     }
 
     #[test]
