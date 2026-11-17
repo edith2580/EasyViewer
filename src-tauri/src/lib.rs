@@ -620,11 +620,35 @@ async fn safe_remote_fetch(
     let resolver = Arc::new(PinnedSsrfResolver {
         pinned: Arc::clone(&pinned_map),
     });
-    let client = reqwest::Client::builder()
+    let client_builder = reqwest::Client::builder()
         .redirect(Policy::none())
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-        .danger_accept_invalid_certs(allow_self_signed)
-        .dns_resolver(resolver)
+        .dns_resolver(resolver);
+
+    // On Android, reqwest's default `rustls-platform-verifier` panics unless a custom
+    // Kotlin/JNI verifier component is wired up. Use `webpki-roots` directly when
+    // verifying standard HTTPS certificates, and `danger_accept_invalid_certs(true)`
+    // when the user explicitly confirms a self-signed NAS certificate.
+    #[cfg(target_os = "android")]
+    let client_builder = if !allow_self_signed {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut tls_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("HTTP_CLIENT_ERROR: {e}"))?
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        client_builder.tls_backend_preconfigured(tls_config)
+    } else {
+        client_builder.danger_accept_invalid_certs(true)
+    };
+
+    #[cfg(not(target_os = "android"))]
+    let client_builder = client_builder.danger_accept_invalid_certs(allow_self_signed);
+
+    let client = client_builder
         .build()
         .map_err(|e| format!("HTTP_CLIENT_ERROR: {e}"))?;
 
