@@ -202,8 +202,8 @@ npm run android:release:all # 전체 ABI release APK
 
 ### GitHub Actions 멀티 플랫폼 자동 릴리즈
 
-- [`.github/workflows/release.yml`](.github/workflows/release.yml): `v*` 태그 푸시 또는 `workflow_dispatch` 수동 실행 시 `npm run verify` 게이트 통과 후 **macOS Universal (`.dmg`)** 및 `build/*.dmg`, **Windows x64 (`-setup.exe`, `.msi`, `_portable.zip` 무설치 버전)**, **Linux x64 (`.deb`, `.rpm`, `.AppImage`)**, **Android arm64 (`.apk`)** 설치 패키지를 병렬 빌드하여 GitHub Release에 자동 첨부(`gh release upload --clobber` 또는 신규 릴리즈 생성, `-` 포함 프리릴리즈 태그 자동 감지)합니다.
-- [`.github/workflows/build-apple.yml`](.github/workflows/build-apple.yml): `main` PR 및 수동 실행용 macOS Universal + iOS 시뮬레이터(`--debug --target aarch64-sim`) 빌드 검증 워크플로우입니다.
+- [`.github/workflows/release.yml`](.github/workflows/release.yml): `v*` 태그 푸시 또는 `workflow_dispatch` 수동 실행 시 `npm run verify` 게이트 통과 후 **macOS Universal (Developer ID 서명·공증된 `.dmg`, `.app.zip`)**, **Windows x64 (`-setup.exe`, `.msi`, `_portable.zip` 무설치 버전)**, **Linux x64 (`.deb`, `.rpm`, `.AppImage`)**, **Android arm64 (`.apk`)** 설치 패키지를 병렬 빌드하여 GitHub Release에 자동 첨부(`gh release upload --clobber` 또는 신규 릴리즈 생성, `-` 포함 프리릴리즈 태그 자동 감지)합니다. 로컬 `build/*.dmg`는 업로드하지 않습니다. macOS 서명 설정은 [docs/macos-signing-notarization.md](docs/macos-signing-notarization.md) 참고.
+- [`.github/workflows/build-apple.yml`](.github/workflows/build-apple.yml): `main` PR 및 수동 실행용 macOS Universal 빌드(서명·공증) 워크플로우입니다. iOS는 CI에서 빌드하지 않으며 로컬 Xcode로 빌드·업로드합니다.
 
 #### 새 버전 릴리즈 실행 절차 (수동 명령어)
 

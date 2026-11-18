@@ -75,5 +75,9 @@ describe('Multi-platform release GitHub Actions workflows', () => {
     expect(content).toContain('node-version: 24')
     expect(content).toContain('bash scripts/ci/macos-build-signed.sh')
     expect(content).toContain('bundle/macos/*.app.zip')
+
+    // iOS is built/uploaded locally via Xcode; no unusable simulator build in CI.
+    expect(content).not.toMatch(/^\s{2}ios:/m)
+    expect(content).not.toContain('aarch64-sim')
   })
 })

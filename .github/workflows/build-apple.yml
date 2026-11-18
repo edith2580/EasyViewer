@@ -1,4 +1,6 @@
-name: Build Apple (macOS / iOS)
+# macOS universal build (manual / PR). iOS is built and uploaded locally via Xcode
+# (TestFlight / App Store); an unsigned simulator build in CI produced nothing usable.
+name: Build macOS
 
 on:
   workflow_dispatch:
@@ -42,21 +44,4 @@ jobs:
             src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
             src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.zip
           if-no-files-found: error
-
-  ios:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
-      - run: npm ci
-      - run: npm run ios:init
-      # Unsigned simulator-less build check. For App Store / device builds set
-      # APPLE_DEVELOPMENT_TEAM and signing secrets, then run `npm run ios:build`.
-      - run: npm run ios:build -- --debug --target aarch64-sim
-        continue-on-error: true
 
