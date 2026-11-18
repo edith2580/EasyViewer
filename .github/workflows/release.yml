@@ -52,9 +52,10 @@ jobs:
           - name: macos-universal
             os: macos-latest
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
-            build_cmd: npm run mac:build
+            build_cmd: bash scripts/ci/macos-build-signed.sh
             bundle_path: |
               src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+              src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.zip
           - name: windows-x64
             os: windows-latest
             rust_targets: x86_64-pc-windows-msvc
@@ -97,8 +98,25 @@ jobs:
             rpm
       - run: npm ci
       - name: Build Tauri bundle (${{ matrix.name }})
+        if: matrix.name != 'macos-universal'
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: ${{ matrix.build_cmd }}
+      # Developer ID signing + notarization so downloaded builds pass Gatekeeper.
+      # See scripts/ci/macos-build-signed.sh for the required secrets.
+      - name: Build, sign and notarize macOS bundle
+        if: matrix.name == 'macos-universal'
+        env:
+          REQUIRE_MAC_SIGNING: '1'
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
         run: ${{ matrix.build_cmd }}
       - name: Package Windows portable ZIP
         if: matrix.name == 'windows-x64'
@@ -108,13 +126,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path "src-tauri/target/release/bundle/portable" | Out-Null
           Copy-Item "src-tauri/target/release/easy-viewer.exe" "src-tauri/target/release/bundle/portable/EasyViewer.exe" -Force
           Compress-Archive -Path "src-tauri/target/release/bundle/portable/EasyViewer.exe" -DestinationPath "src-tauri/target/release/bundle/portable/EasyViewer_${version}_x64_portable.zip" -Force
-      - name: Verify macOS bundle signature and DMG integrity
-        if: matrix.name == 'macos-universal'
-        run: |
-          codesign --verify --deep --strict -vvv src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
-          for dmg in src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg; do
-            hdiutil verify "$dmg"
-          done
       - uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.name }}
@@ -216,10 +227,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          if compgen -G "build/*.dmg" > /dev/null; then
-            cp build/*.dmg release-assets/
-          fi
-          find release-artifacts -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.zip' -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.apk' \) -exec cp {} release-assets/ \;
+          # Only ship CI-built (signed/notarized) artifacts. Locally built DMGs in
+          # build/ are ad-hoc signed and would be blocked by Gatekeeper.
+          find release-artifacts -type f \( -name '*.dmg' -o -name '*.app.zip' -o -name '*.exe' -o -name '*.msi' -o -name '*.zip' -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.apk' \) -exec cp {} release-assets/ \;
           ls -lh release-assets
 
           if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
