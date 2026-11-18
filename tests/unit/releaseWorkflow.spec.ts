@@ -19,7 +19,6 @@ describe('Multi-platform release GitHub Actions workflows', () => {
     // Desktop matrix platforms
     expect(content).toContain('macos-latest')
     expect(content).toContain('aarch64-apple-darwin,x86_64-apple-darwin')
-    expect(content).toContain('npm run mac:build')
     expect(content).toContain('windows-latest')
     expect(content).toContain('--bundles nsis,msi')
     expect(content).toContain('_x64_portable.zip')
@@ -28,6 +27,16 @@ describe('Multi-platform release GitHub Actions workflows', () => {
     expect(content).toContain('libwebkit2gtk-4.1-dev')
     expect(content).toContain('APPIMAGE_EXTRACT_AND_RUN')
 
+    // macOS: Developer ID signing + notarization (Gatekeeper-safe downloads), required for releases
+    expect(content).toContain('bash scripts/ci/macos-build-signed.sh')
+    expect(content).toContain("REQUIRE_MAC_SIGNING: '1'")
+    expect(content).toContain('secrets.APPLE_CERTIFICATE')
+    expect(content).toContain('secrets.APPLE_CERTIFICATE_PASSWORD')
+    expect(content).toContain('secrets.APPLE_ID')
+    expect(content).toContain('secrets.APPLE_PASSWORD')
+    expect(content).toContain('secrets.APPLE_TEAM_ID')
+    expect(content).toContain('bundle/macos/*.app.zip')
+
     // Android release APK build
     expect(content).toContain("java-version: '21'")
     expect(content).toContain('android-actions/setup-android@v4')
@@ -35,11 +44,25 @@ describe('Multi-platform release GitHub Actions workflows', () => {
     expect(content).toContain('npm run android:init')
     expect(content).toContain('npm run android:release')
 
-    // GitHub Release upload (create or clobber existing tag release, including build/*.dmg)
+    // GitHub Release upload (create or clobber existing tag release) with CI-built artifacts only.
+    // Locally built build/*.dmg files are ad-hoc signed and must not be published.
     expect(content).toContain('publish-release:')
-    expect(content).toContain('build/*.dmg')
+    expect(content).not.toContain('build/*.dmg')
     expect(content).toContain('gh release upload')
     expect(content).toContain('gh release create')
+  })
+
+  it('ships a CI macOS build script that signs with Developer ID and notarizes', () => {
+    const scriptPath = path.join(ROOT_DIR, 'scripts/ci/macos-build-signed.sh')
+    expect(fs.existsSync(scriptPath)).toBe(true)
+
+    const content = fs.readFileSync(scriptPath, 'utf-8')
+    expect(content).toContain('universal-apple-darwin')
+    expect(content).toContain('Developer ID Application')
+    expect(content).toContain('xcrun notarytool submit')
+    expect(content).toContain('xcrun stapler staple')
+    expect(content).toContain('spctl --assess')
+    expect(content).toContain('ditto -c -k')
   })
 
   it('keeps build-apple.yml scoped to manual/PR Apple validation without duplicating v* tag release triggers', () => {
@@ -50,5 +73,7 @@ describe('Multi-platform release GitHub Actions workflows', () => {
     expect(content).toContain('pull_request:')
     expect(content).not.toMatch(/tags:\s*\n\s*-\s*['"]?v\*['"]?/)
     expect(content).toContain('node-version: 24')
+    expect(content).toContain('bash scripts/ci/macos-build-signed.sh')
+    expect(content).toContain('bundle/macos/*.app.zip')
   })
 })
