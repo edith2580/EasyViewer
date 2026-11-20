@@ -66,7 +66,6 @@ export interface BookMeta {
   fileSize: number
   coverUrl?: string
   sourceUrl?: string
-  isOfflineCached: boolean
   /** Original file name, e.g. "윤동주 시선 - 별 헤는 밤.txt". */
   fileName?: string
   /** Desktop/mobile app: absolute path of the stored file (in the storage folder at import time). */

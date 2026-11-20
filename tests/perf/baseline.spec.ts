@@ -33,7 +33,6 @@ test('captures web DOM/layout performance baseline across core user journeys', a
           author: '벤치마크',
           format: 'txt',
           fileSize: txtBody.length,
-          isOfflineCached: true,
           addedAt: ts,
           lastOpenedAt: ts + count
         },
@@ -43,7 +42,6 @@ test('captures web DOM/layout performance baseline across core user journeys', a
           author: `저자 ${i + 1}`,
           format: 'txt',
           fileSize: 1024 + i,
-          isOfflineCached: true,
           addedAt: ts + i,
           lastOpenedAt: ts + i
         }))

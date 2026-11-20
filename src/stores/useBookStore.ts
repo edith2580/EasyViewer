@@ -185,7 +185,6 @@ export const useBookStore = defineStore('books', () => {
       fileSize: buffer.byteLength,
       coverUrl,
       sourceUrl,
-      isOfflineCached: true,
       fileName,
       storedPath,
       addedAt: existingIdx >= 0 ? books.value[existingIdx].addedAt : now,

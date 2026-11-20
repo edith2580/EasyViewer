@@ -51,7 +51,6 @@ describe('PlatformStorageAdapter & initLibrary IPC characterization', () => {
         author: 'Author',
         format: 'txt',
         fileSize: 100,
-        isOfflineCached: true,
         storedPath: `/Users/tester/Books/book-${idx}.txt`,
         addedAt: 1000 + idx,
         lastOpenedAt: 1000 + idx

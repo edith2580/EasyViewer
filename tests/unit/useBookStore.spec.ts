@@ -42,7 +42,6 @@ describe('useBookStore characterization', () => {
         author: '작가',
         format: 'txt',
         fileSize: 120,
-        isOfflineCached: true,
         addedAt: 1000,
         lastOpenedAt: 2000
       }

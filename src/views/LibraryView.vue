@@ -27,10 +27,11 @@ import {
   Coffee,
   Search,
   Sparkles,
-  CheckCircle2,
   FolderOpen,
   FolderCog,
-  RotateCcw
+  RotateCcw,
+  ArrowUp,
+  ArrowDown
 } from 'lucide-vue-next'
 
 const router = useRouter()
@@ -40,8 +41,22 @@ const settingsStore = useSettingsStore()
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const isDragging = ref(false)
 let unlistenDragDrop: (() => void) | null = null
+type BookSortKey = 'recent' | 'name' | 'progress'
+type BookSortOrder = 'asc' | 'desc'
+
 const filterFormat = ref<'all' | BookFormat>('all')
+const sortBy = ref<BookSortKey>('recent')
+const sortOrder = ref<BookSortOrder>('desc')
 const searchQuery = ref('')
+
+function selectSort(key: BookSortKey) {
+  if (sortBy.value === key) {
+    sortOrder.value = sortOrder.value === 'asc' ? 'desc' : 'asc'
+  } else {
+    sortBy.value = key
+    sortOrder.value = key === 'name' ? 'asc' : 'desc'
+  }
+}
 const showDownloadModal = ref(false)
 const showSyncModal = ref(false)
 const toastMessage = ref('')
@@ -145,18 +160,38 @@ onBeforeUnmount(() => {
 })
 
 const filteredBooks = computed(() => {
-  return bookStore.sortedBooks.filter((book) => {
+  const q = searchQuery.value.trim().toLowerCase()
+  const filtered = bookStore.sortedBooks.filter((book) => {
     if (filterFormat.value !== 'all' && book.format !== filterFormat.value) {
       return false
     }
-    if (searchQuery.value.trim()) {
-      const q = searchQuery.value.toLowerCase()
+    if (q) {
       return (
         book.title.toLowerCase().includes(q) ||
-        book.author.toLowerCase().includes(q)
+        book.author.toLowerCase().includes(q) ||
+        (book.fileName ? book.fileName.toLowerCase().includes(q) : false)
       )
     }
     return true
+  })
+
+  const dir = sortOrder.value === 'asc' ? 1 : -1
+  return [...filtered].sort((a, b) => {
+    if (sortBy.value === 'name') {
+      const nameA = a.fileName || a.title
+      const nameB = b.fileName || b.title
+      const cmp = nameA.localeCompare(nameB, 'ko', { numeric: true, sensitivity: 'base' })
+      if (cmp !== 0) return cmp * dir
+    } else if (sortBy.value === 'progress') {
+      const pctA = a.lastLocation?.percentage ?? 0
+      const pctB = b.lastLocation?.percentage ?? 0
+      if (pctA !== pctB) return (pctA - pctB) * dir
+    } else {
+      const timeA = a.lastOpenedAt || a.addedAt
+      const timeB = b.lastOpenedAt || b.addedAt
+      if (timeA !== timeB) return (timeA - timeB) * dir
+    }
+    return (b.lastOpenedAt || b.addedAt) - (a.lastOpenedAt || a.addedAt)
   })
 })
 
@@ -279,10 +314,11 @@ function formatFileSize(bytes: number): string {
 
         <button
           type="button"
-          class="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-sm transition-all"
+          class="flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-semibold hover:border-indigo-500 transition-all"
+          :style="{ borderColor: 'var(--ev-border)' }"
           @click="fileInputRef?.click()"
         >
-          <Upload class="w-4 h-4" />
+          <Upload class="w-4 h-4 text-indigo-500" />
           <span>파일 열기</span>
         </button>
 
@@ -415,27 +451,57 @@ function formatFileSize(bytes: number): string {
       </div>
     </header>
 
-    <!-- Sub-toolbar: Filter & Search -->
+    <!-- Sub-toolbar: Filter, Sort & Search -->
     <div class="px-4 sm:px-8 py-3 flex flex-wrap items-center justify-between gap-3 shrink-0">
-      <div class="flex items-center gap-1.5 p-1 rounded-xl bg-black/5 dark:bg-white/5">
-        <button
-          v-for="tab in ([
-            { key: 'all', label: '전체 문서' },
-            { key: 'epub', label: 'EPUB' },
-            { key: 'txt', label: 'TXT' }
-          ] as const)"
-          :key="tab.key"
-          type="button"
-          class="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all"
-          :class="
-            filterFormat === tab.key
-              ? 'bg-indigo-600 text-white shadow-xs'
-              : 'opacity-70 hover:opacity-100'
-          "
-          @click="filterFormat = tab.key"
-        >
-          {{ tab.label }}
-        </button>
+      <div class="flex flex-wrap items-center gap-2">
+        <div class="flex items-center gap-1.5 p-1 rounded-xl bg-black/5 dark:bg-white/5">
+          <button
+            v-for="tab in ([
+              { key: 'all', label: '전체 문서' },
+              { key: 'epub', label: 'EPUB' },
+              { key: 'txt', label: 'TXT' }
+            ] as const)"
+            :key="tab.key"
+            type="button"
+            class="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all"
+            :class="
+              filterFormat === tab.key
+                ? 'bg-indigo-600 text-white shadow-xs'
+                : 'opacity-70 hover:opacity-100'
+            "
+            @click="filterFormat = tab.key"
+          >
+            {{ tab.label }}
+          </button>
+        </div>
+
+        <div class="flex items-center gap-1 p-1 rounded-xl bg-black/5 dark:bg-white/5">
+          <button
+            v-for="opt in ([
+              { key: 'name', label: '이름' },
+              { key: 'recent', label: '접근' },
+              { key: 'progress', label: '페이지' }
+            ] as const)"
+            :key="opt.key"
+            type="button"
+            class="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all"
+            :class="
+              sortBy === opt.key
+                ? 'bg-indigo-600 text-white shadow-xs'
+                : 'opacity-70 hover:opacity-100'
+            "
+            :title="
+              sortBy === opt.key
+                ? `${opt.label} (${sortOrder === 'asc' ? '오름차순' : '내림차순'}, 다시 클릭하여 방향 전환)`
+                : `${opt.label} 정렬`
+            "
+            @click="selectSort(opt.key)"
+          >
+            <span>{{ opt.label }}</span>
+            <ArrowUp v-if="sortBy === opt.key && sortOrder === 'asc'" class="w-3 h-3" />
+            <ArrowDown v-else-if="sortBy === opt.key && sortOrder === 'desc'" class="w-3 h-3" />
+          </button>
+        </div>
       </div>
 
       <div class="relative w-full sm:w-64">
@@ -505,15 +571,6 @@ function formatFileSize(bytes: number): string {
                   <BookOpen v-if="book.format === 'epub'" class="w-3 h-3" />
                   <FileText v-else class="w-3 h-3" />
                   {{ book.format }}
-                </span>
-
-                <span
-                  v-if="book.isOfflineCached"
-                  class="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-black/5 dark:bg-white/10 opacity-75"
-                  title="오프라인 읽기 가능"
-                >
-                  <CheckCircle2 class="w-3 h-3 text-emerald-500" />
-                  오프라인
                 </span>
               </div>
 

@@ -740,7 +740,7 @@ function formatItemDate(rawDate?: string): string {
           </div>
 
           <div>
-            <h1 class="text-lg font-extrabold tracking-tight">원격 문서 다운로드</h1>
+            <h1 class="text-lg font-extrabold tracking-tight">다운로드</h1>
           </div>
         </div>
 
