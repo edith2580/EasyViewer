@@ -516,6 +516,7 @@ fn get_platform_os() -> String {
     std::env::consts::OS.to_string()
 }
 
+#[cfg(target_os = "windows")]
 fn normalize_win_dir_key(path: &Path) -> String {
     normalize_windows_verbatim(path)
         .to_string_lossy()
@@ -1573,6 +1574,7 @@ mod tests {
         assert!(validate_update_asset_name("../evil.exe", "windows").is_err());
         assert!(validate_update_asset_name("EasyViewer_0.2.3_android.apk", "windows").is_err());
 
+        #[cfg(target_os = "windows")]
         assert_eq!(
             normalize_win_dir_key(Path::new(r"\\?\D:\Custom\EasyViewer\")),
             r"d:\custom\easyviewer"
