@@ -110,8 +110,19 @@ describe('/__remote_proxy Zero-Trust security middleware (US3 - TDD)', () => {
     certTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ev-proxy-cert-'))
     const keyPath = path.join(certTmpDir, 'key.pem')
     const certPath = path.join(certTmpDir, 'cert.pem')
+    const opensslCandidates =
+      process.platform === 'win32'
+        ? [
+            'openssl',
+            'C:\\Program Files\\Git\\usr\\bin\\openssl.exe',
+            'C:\\Program Files\\Git\\mingw64\\bin\\openssl.exe',
+            'C:\\Program Files\\OpenSSL-Win64\\bin\\openssl.exe'
+          ]
+        : ['openssl']
+    const opensslBin =
+      opensslCandidates.find((bin) => bin !== 'openssl' && fs.existsSync(bin)) || 'openssl'
     execFileSync(
-      'openssl',
+      opensslBin,
       [
         'req',
         '-x509',
@@ -127,7 +138,7 @@ describe('/__remote_proxy Zero-Trust security middleware (US3 - TDD)', () => {
         '-subj',
         '/CN=private-nas.local'
       ],
-      { stdio: 'ignore' }
+      { stdio: 'ignore', env: { ...process.env, MSYS_NO_PATHCONV: '1' } }
     )
     httpsUpstreamServer = https.createServer(
       {
@@ -201,10 +212,12 @@ describe('/__remote_proxy Zero-Trust security middleware (US3 - TDD)', () => {
   })
 
   afterAll(async () => {
-    await new Promise<void>((resolve) => deadlineProxyServer?.close(() => resolve()))
-    await new Promise<void>((resolve) => proxyServer?.close(() => resolve()))
-    await new Promise<void>((resolve) => httpsUpstreamServer?.close(() => resolve()))
-    await new Promise<void>((resolve) => upstreamServer?.close(() => resolve()))
+    const closeServer = (server?: http.Server | https.Server) =>
+      server ? new Promise<void>((resolve) => server.close(() => resolve())) : Promise.resolve()
+    await closeServer(deadlineProxyServer)
+    await closeServer(proxyServer)
+    await closeServer(httpsUpstreamServer)
+    await closeServer(upstreamServer)
     if (certTmpDir) {
       fs.rmSync(certTmpDir, { recursive: true, force: true })
     }
