@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { extractChangelogSection } from '../../scripts/extract-changelog.mjs'
 
 const ROOT_DIR = path.resolve(__dirname, '../..')
 
@@ -48,8 +49,33 @@ describe('Multi-platform release GitHub Actions workflows', () => {
     // Locally built build/*.dmg files are ad-hoc signed and must not be published.
     expect(content).toContain('publish-release:')
     expect(content).not.toContain('build/*.dmg')
+    expect(content).toContain('scripts/extract-changelog.mjs')
+    expect(content).toContain('--notes-file release-notes.md')
+    expect(content).toContain('gh release edit')
     expect(content).toContain('gh release upload')
     expect(content).toContain('gh release create')
+  })
+
+  it('extracts version-specific Markdown release notes from CHANGELOG.md', () => {
+    const sample = [
+      '# 변경 내역 (Changelog)',
+      '',
+      '## v0.2.4',
+      '',
+      '### 새 기능',
+      '- 정보 탭 추가',
+      '',
+      '---',
+      '',
+      '## [0.2.3] - 2026-11-20',
+      '',
+      '- Linux CI 테스트 수정'
+    ].join('\n')
+
+    expect(extractChangelogSection(sample, 'v0.2.4')).toBe('### 새 기능\n- 정보 탭 추가')
+    expect(extractChangelogSection(sample, '0.2.4')).toBe('### 새 기능\n- 정보 탭 추가')
+    expect(extractChangelogSection(sample, 'v0.2.3')).toBe('- Linux CI 테스트 수정')
+    expect(extractChangelogSection(sample, 'v9.9.9')).toBe('')
   })
 
   it('ships a CI macOS build script that signs with Developer ID and notarizes', () => {

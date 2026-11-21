@@ -245,8 +245,24 @@ jobs:
             PRERELEASE_FLAG="--prerelease"
           fi
 
+          node scripts/extract-changelog.mjs --tag "$TAG" --file CHANGELOG.md --out release-notes.md
+
           if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ -s release-notes.md ]; then
+              gh release edit "$TAG" --title "EasyViewer $TAG" --notes-file release-notes.md
+            fi
             gh release upload "$TAG" release-assets/* --clobber
+          elif [ -s release-notes.md ]; then
+            if [ -n "$PRERELEASE_FLAG" ]; then
+              gh release create "$TAG" release-assets/* \
+                --title "EasyViewer $TAG" \
+                --notes-file release-notes.md \
+                --prerelease
+            else
+              gh release create "$TAG" release-assets/* \
+                --title "EasyViewer $TAG" \
+                --notes-file release-notes.md
+            fi
           elif [ -n "$PRERELEASE_FLAG" ]; then
             gh release create "$TAG" release-assets/* \
               --title "EasyViewer $TAG" \
