@@ -28,6 +28,13 @@
     },
     "store:default",
     "dialog:default",
-    "keyring-store:default"
+    "keyring-store:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://github.com/edith2580/EasyViewer" },
+        { "url": "https://github.com/edith2580/EasyViewer/**" }
+      ]
+    }
   ]
 }

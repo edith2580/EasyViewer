@@ -1014,7 +1014,6 @@ onBeforeUnmount(() => {
           @click="settingsOpen = true"
         >
           <Settings class="w-3.5 h-3.5" />
-          <span class="hidden sm:inline">옵션</span>
         </button>
       </div>
     </header>

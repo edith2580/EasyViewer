@@ -15,6 +15,7 @@ import {
 import type { BookFormat, BookMeta } from '@/types'
 import NetworkDownloadModal from '@/components/library/NetworkDownloadModal.vue'
 import SyncModal from '@/components/library/SyncModal.vue'
+import AppInfoModal from '@/components/library/AppInfoModal.vue'
 import {
   BookOpen,
   FileText,
@@ -31,7 +32,8 @@ import {
   FolderCog,
   RotateCcw,
   ArrowUp,
-  ArrowDown
+  ArrowDown,
+  Info
 } from 'lucide-vue-next'
 
 const router = useRouter()
@@ -59,6 +61,7 @@ function selectSort(key: BookSortKey) {
 }
 const showDownloadModal = ref(false)
 const showSyncModal = ref(false)
+const showInfoModal = ref(false)
 const toastMessage = ref('')
 
 // Storage folder (Windows/macOS app only)
@@ -448,6 +451,16 @@ function formatFileSize(bytes: number): string {
           <Coffee v-else-if="settingsStore.settings.theme === 'sepia'" class="w-4 h-4 text-amber-800" />
           <Moon v-else class="w-4 h-4 text-indigo-400" />
         </button>
+
+        <button
+          type="button"
+          class="p-2 rounded-xl border hover:border-indigo-500 transition-all"
+          :style="{ borderColor: 'var(--ev-border)' }"
+          title="앱 정보 및 업데이트"
+          @click="showInfoModal = true"
+        >
+          <Info class="w-4 h-4 text-indigo-500" />
+        </button>
       </div>
     </header>
 
@@ -498,8 +511,10 @@ function formatFileSize(bytes: number): string {
             @click="selectSort(opt.key)"
           >
             <span>{{ opt.label }}</span>
-            <ArrowUp v-if="sortBy === opt.key && sortOrder === 'asc'" class="w-3 h-3" />
-            <ArrowDown v-else-if="sortBy === opt.key && sortOrder === 'desc'" class="w-3 h-3" />
+            <template v-if="sortBy === opt.key">
+              <ArrowUp v-if="sortOrder === 'asc'" class="w-3 h-3" />
+              <ArrowDown v-else class="w-3 h-3" />
+            </template>
           </button>
         </div>
       </div>
@@ -649,6 +664,11 @@ function formatFileSize(bytes: number): string {
     <SyncModal
       :open="showSyncModal"
       @close="showSyncModal = false"
+    />
+
+    <AppInfoModal
+      :open="showInfoModal"
+      @close="showInfoModal = false"
     />
   </div>
 </template>

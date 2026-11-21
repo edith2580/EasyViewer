@@ -579,7 +579,6 @@ function formatItemDate(rawDate?: string): string {
                 <ArrowUp v-if="explorerSortOrder === 'asc'" class="w-3 h-3" />
                 <ArrowDown v-else class="w-3 h-3" />
               </template>
-              <ArrowUpDown v-else class="w-3 h-3 opacity-40" />
             </button>
           </div>
 

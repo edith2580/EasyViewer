@@ -510,6 +510,421 @@ fn is_desktop() -> bool {
     cfg!(desktop)
 }
 
+/// Returns the compiled target OS (`windows`, `macos`, `linux`, `android`, `ios`).
+#[tauri::command]
+fn get_platform_os() -> String {
+    std::env::consts::OS.to_string()
+}
+
+fn normalize_win_dir_key(path: &Path) -> String {
+    normalize_windows_verbatim(path)
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+/// Checks Windows Registry (NSIS Uninstall key, WiX/MSI InstallDir key, and generic
+/// Uninstall subkeys with `DisplayName == EasyViewer`) against the running `exe_dir`.
+#[cfg(target_os = "windows")]
+fn detect_windows_install_mode_from_registry(exe_dir_key: &str) -> Option<&'static str> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    let roots = [
+        RegKey::predef(HKEY_CURRENT_USER),
+        RegKey::predef(HKEY_LOCAL_MACHINE),
+    ];
+
+    // 1. Check NSIS standard Uninstall\EasyViewer key
+    for root in &roots {
+        if let Ok(key) = root.open_subkey_with_flags(
+            r"Software\Microsoft\Windows\CurrentVersion\Uninstall\EasyViewer",
+            KEY_READ,
+        ) {
+            if let Ok(loc) = key.get_value::<String, _>("InstallLocation") {
+                if normalize_win_dir_key(Path::new(&loc)) == exe_dir_key {
+                    return Some("nsis");
+                }
+            }
+        }
+    }
+
+    // 2. Check WiX/MSI custom InstallDir registry key written by Tauri's WiX template
+    if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(r"Software\edith\EasyViewer", KEY_READ)
+    {
+        if let Ok(loc) = key.get_value::<String, _>("InstallDir") {
+            if normalize_win_dir_key(Path::new(&loc)) == exe_dir_key {
+                return Some("msi");
+            }
+        }
+    }
+
+    // 3. Scan Uninstall subkeys (covers custom MSI install dirs & ProductCode GUID entries)
+    let uninstall_paths = [
+        r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    ];
+    for root in &roots {
+        for base_path in &uninstall_paths {
+            let Ok(uninstall_root) = root.open_subkey_with_flags(base_path, KEY_READ) else {
+                continue;
+            };
+            for sub_name in uninstall_root.enum_keys().flatten() {
+                let Ok(sub) = uninstall_root.open_subkey_with_flags(&sub_name, KEY_READ) else {
+                    continue;
+                };
+                let Ok(display_name) = sub.get_value::<String, _>("DisplayName") else {
+                    continue;
+                };
+                if !display_name.trim().eq_ignore_ascii_case("EasyViewer") {
+                    continue;
+                }
+                let Ok(loc) = sub.get_value::<String, _>("InstallLocation") else {
+                    continue;
+                };
+                if normalize_win_dir_key(Path::new(&loc)) != exe_dir_key {
+                    continue;
+                }
+                let is_msi = sub
+                    .get_value::<u32, _>("WindowsInstaller")
+                    .is_ok_and(|v| v == 1)
+                    || sub
+                        .get_value::<String, _>("UninstallString")
+                        .is_ok_and(|s| s.to_ascii_lowercase().contains("msiexec"));
+                return Some(if is_msi { "msi" } else { "nsis" });
+            }
+        }
+    }
+
+    None
+}
+
+/// Distinguishes Windows installation modes (`nsis`, `msi`, `portable`) by matching
+/// the running executable directory against Windows Uninstall/WiX registry entries
+/// and the NSIS sibling `uninstall.exe`.
+pub fn detect_windows_install_mode(exe_path: &Path) -> &'static str {
+    let Some(dir) = exe_path.parent() else {
+        return "portable";
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        let exe_dir_key = normalize_win_dir_key(dir);
+        if let Some(mode) = detect_windows_install_mode_from_registry(&exe_dir_key) {
+            return mode;
+        }
+    }
+
+    if dir.join("uninstall.exe").exists() {
+        return "nsis";
+    }
+
+    "portable"
+}
+
+#[tauri::command]
+fn get_install_mode() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            return detect_windows_install_mode(&exe).to_string();
+        }
+        return "portable".to_string();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "standard".to_string()
+    }
+}
+
+const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/edith2580/EasyViewer/releases/download/";
+const ALLOWED_UPDATE_HOSTS: &[&str] = &[
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+];
+
+pub fn validate_release_download_url(raw_url: &str) -> Result<Url, String> {
+    let trimmed = raw_url.trim();
+    if !trimmed.starts_with(RELEASE_DOWNLOAD_PREFIX) {
+        return Err("SECURITY_DENIED: 허용되지 않은 업데이트 다운로드 출처입니다.".into());
+    }
+    let parsed = validate_url_syntax(trimmed)?;
+    if parsed.scheme() != "https" {
+        return Err("SECURITY_DENIED: HTTPS 업데이트 URL만 허용됩니다.".into());
+    }
+    Ok(parsed)
+}
+
+pub fn validate_update_asset_name(asset_name: &str, os: &str) -> Result<String, String> {
+    let trimmed = asset_name.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || trimmed.contains('\0')
+    {
+        return Err("INVALID_ASSET_NAME: 유효하지 않은 업데이트 파일 이름입니다.".into());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let valid_ext = match os {
+        "windows" => lower.ends_with(".exe") || lower.ends_with(".msi") || lower.ends_with(".zip"),
+        "macos" => lower.ends_with(".dmg"),
+        "linux" => lower.ends_with(".appimage") || lower.ends_with(".deb") || lower.ends_with(".rpm"),
+        _ => false,
+    };
+    if !valid_ext {
+        return Err(format!(
+            "UNSUPPORTED_UPDATE_ASSET: 현재 플랫폼({os})에서 자동 설치를 지원하지 않는 파일입니다: {trimmed}"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Downloads a verified GitHub Release installer for the current desktop OS and launches it.
+#[cfg(desktop)]
+#[tauri::command]
+async fn install_release_update(
+    app: tauri::AppHandle,
+    download_url: String,
+    asset_name: String,
+) -> Result<String, String> {
+    let initial_url = validate_release_download_url(&download_url)?;
+    let safe_name = validate_update_asset_name(&asset_name, std::env::consts::OS)?;
+
+    let client = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|e| format!("HTTP_CLIENT_ERROR: {e}"))?;
+
+    let mut current_url = initial_url;
+    let mut final_response = None;
+    for hop in 0..=MAX_REDIRECTS {
+        let host = current_url
+            .host_str()
+            .map(|h| h.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !ALLOWED_UPDATE_HOSTS.contains(&host.as_str()) {
+            return Err(format!(
+                "SECURITY_DENIED: 허용되지 않은 업데이트 호스트로 리다이렉트되었습니다: {host}"
+            ));
+        }
+        let resp = client
+            .get(current_url.clone())
+            .header("User-Agent", "EasyViewer-Updater")
+            .send()
+            .await
+            .map_err(|e| format!("UPDATE_DOWNLOAD_FAILED: 업데이트 다운로드 실패: {e}"))?;
+
+        if resp.status().is_redirection() {
+            if hop >= MAX_REDIRECTS {
+                return Err("TOO_MANY_REDIRECTS: 업데이트 리다이렉트 횟수를 초과했습니다.".into());
+            }
+            let location = resp
+                .headers()
+                .get(LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| "INVALID_REDIRECT: Location 헤더가 없습니다.".to_string())?;
+            let next_url = current_url
+                .join(location)
+                .map_err(|e| format!("INVALID_REDIRECT: {e}"))?;
+            if next_url.scheme() != "https" {
+                return Err("SECURITY_DENIED: HTTPS가 아닌 업데이트 리다이렉트는 차단됩니다.".into());
+            }
+            current_url = next_url;
+            continue;
+        }
+
+        if !resp.status().is_success() {
+            return Err(format!(
+                "UPDATE_DOWNLOAD_FAILED: 서버 응답 오류 (HTTP {})",
+                resp.status().as_u16()
+            ));
+        }
+        final_response = Some(resp);
+        break;
+    }
+
+    let mut response = final_response
+        .ok_or_else(|| "UPDATE_DOWNLOAD_FAILED: 업데이트 응답을 수신하지 못했습니다.".to_string())?;
+
+    if let Some(len) = response.content_length() {
+        if len > MAX_BOOK_BYTES {
+            return Err("RESPONSE_TOO_LARGE: 업데이트 파일 크기가 허용 상한을 초과했습니다.".into());
+        }
+    }
+
+    let update_dir = std::env::temp_dir().join("easyviewer-updates");
+    std::fs::create_dir_all(&update_dir)
+        .map_err(|e| format!("UPDATE_IO_FAILED: 임시 업데이트 폴더 생성 실패: {e}"))?;
+    let dest_path = update_dir.join(&safe_name);
+
+    let mut acc = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("UPDATE_DOWNLOAD_FAILED: 다운로드 스트림 오류: {e}"))?
+    {
+        if (acc.len().saturating_add(chunk.len()) as u64) > MAX_BOOK_BYTES {
+            return Err("RESPONSE_TOO_LARGE: 업데이트 파일 크기가 허용 상한을 초과했습니다.".into());
+        }
+        acc.extend_from_slice(&chunk);
+    }
+
+    std::fs::write(&dest_path, &acc)
+        .map_err(|e| format!("UPDATE_IO_FAILED: 업데이트 파일 저장 실패: {e}"))?;
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        let lower = safe_name.to_ascii_lowercase();
+        if lower.ends_with(".zip") {
+            let current_exe = std::env::current_exe()
+                .map_err(|e| format!("UPDATE_IO_FAILED: 현재 실행 파일 경로 확인 실패: {e}"))?;
+            let extract_dir = update_dir.join("portable-extracted");
+            let _ = std::fs::remove_dir_all(&extract_dir);
+            std::fs::create_dir_all(&extract_dir)
+                .map_err(|e| format!("UPDATE_IO_FAILED: 압축 해제 폴더 생성 실패: {e}"))?;
+
+            let expand_status = std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    "Expand-Archive -LiteralPath $env:EV_ZIP_PATH -DestinationPath $env:EV_EXTRACT_DIR -Force",
+                ])
+                .env("EV_ZIP_PATH", &dest_path)
+                .env("EV_EXTRACT_DIR", &extract_dir)
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()
+                .map_err(|e| format!("UPDATE_EXTRACT_FAILED: 포터블 압축 해제 실패: {e}"))?;
+            if !expand_status.success() {
+                return Err("UPDATE_EXTRACT_FAILED: 포터블 ZIP 압축 해제에 실패했습니다.".into());
+            }
+
+            let new_exe = std::fs::read_dir(&extract_dir)
+                .map_err(|e| format!("UPDATE_EXTRACT_FAILED: 압축 해제 폴더 읽기 실패: {e}"))?
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .find(|p| {
+                    p.is_file()
+                        && p.extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+                })
+                .ok_or_else(|| {
+                    "UPDATE_EXTRACT_FAILED: 포터블 압축 파일 내부에서 실행 파일(.exe)을 찾을 수 없습니다."
+                        .to_string()
+                })?;
+
+            let swap_script = concat!(
+                "$pidToWait = [int]$env:EV_WAIT_PID; ",
+                "$src = $env:EV_NEW_EXE; ",
+                "$dst = $env:EV_TARGET_EXE; ",
+                "$tmp = $env:EV_EXTRACT_DIR; ",
+                "for ($i = 0; $i -lt 30; $i++) { ",
+                "  if (-not (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)) { break } ",
+                "  Start-Sleep -Milliseconds 300 ",
+                "}; ",
+                "for ($i = 0; $i -lt 15; $i++) { ",
+                "  try { ",
+                "    Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop; ",
+                "    Start-Process -FilePath $dst; ",
+                "    break ",
+                "  } catch { Start-Sleep -Milliseconds 400 } ",
+                "}; ",
+                "Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue"
+            );
+
+            std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-Command",
+                    swap_script,
+                ])
+                .env("EV_WAIT_PID", std::process::id().to_string())
+                .env("EV_NEW_EXE", &new_exe)
+                .env("EV_TARGET_EXE", &current_exe)
+                .env("EV_EXTRACT_DIR", &extract_dir)
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .map_err(|e| format!("UPDATE_LAUNCH_FAILED: 포터블 교체 스크립트 실행 실패: {e}"))?;
+
+            let app_handle = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                app_handle.exit(0);
+            });
+            return Ok(current_exe.to_string_lossy().to_string());
+        }
+
+        let spawn_res = if lower.ends_with(".msi") {
+            std::process::Command::new("msiexec")
+                .arg("/i")
+                .arg(&dest_path)
+                .spawn()
+        } else {
+            std::process::Command::new(&dest_path).spawn()
+        };
+        spawn_res.map_err(|e| format!("UPDATE_LAUNCH_FAILED: 설치 프로그램 실행 실패: {e}"))?;
+        let app_handle = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            app_handle.exit(0);
+        });
+        return Ok(dest_path.to_string_lossy().to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = &app;
+        std::process::Command::new("open")
+            .arg(&dest_path)
+            .spawn()
+            .map_err(|e| format!("UPDATE_LAUNCH_FAILED: DMG 열기 실패: {e}"))?;
+        return Ok(dest_path.to_string_lossy().to_string());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = &app;
+        let lower = safe_name.to_ascii_lowercase();
+        if lower.ends_with(".appimage") {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&dest_path)
+                .map_err(|e| format!("UPDATE_IO_FAILED: {e}"))?
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&dest_path, perms)
+                .map_err(|e| format!("UPDATE_IO_FAILED: {e}"))?;
+            std::process::Command::new(&dest_path)
+                .spawn()
+                .map_err(|e| format!("UPDATE_LAUNCH_FAILED: AppImage 실행 실패: {e}"))?;
+        } else {
+            std::process::Command::new("xdg-open")
+                .arg(&dest_path)
+                .spawn()
+                .map_err(|e| format!("UPDATE_LAUNCH_FAILED: 패키지 열기 실패: {e}"))?;
+        }
+        return Ok(dest_path.to_string_lossy().to_string());
+    }
+
+    #[allow(unreachable_code)]
+    Ok(dest_path.to_string_lossy().to_string())
+}
+
 /// Creates `path` if needed after ancestor canonicalization & deny-list checks and registers it
 /// in both the Rust Zero-Trust whitelist and the Tauri fs scope for this run.
 #[cfg(desktop)]
@@ -782,13 +1197,18 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             is_desktop,
+            get_platform_os,
+            get_install_mode,
             allow_storage_dir,
             read_validated_book_file,
-            safe_remote_fetch
+            safe_remote_fetch,
+            install_release_update
         ]);
     #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![
         is_desktop,
+        get_platform_os,
+        get_install_mode,
         safe_remote_fetch
     ]);
 
@@ -1135,5 +1555,36 @@ mod tests {
         let expired_past =
             compute_remaining_budget(deadline, deadline + Duration::from_millis(5)).unwrap_err();
         assert!(expired_past.contains("TIMEOUT:"));
+    }
+
+    #[test]
+    fn validates_release_update_urls_and_asset_names() {
+        assert!(validate_release_download_url(
+            "https://github.com/edith2580/EasyViewer/releases/download/v0.2.3/EasyViewer_0.2.3_x64-setup.exe"
+        )
+        .is_ok());
+        assert!(validate_release_download_url("https://evil.example/EasyViewer.exe").is_err());
+        assert!(validate_release_download_url("http://github.com/edith2580/EasyViewer/releases/download/v0.2.3/a.exe").is_err());
+
+        assert!(validate_update_asset_name("EasyViewer_0.2.3_x64-setup.exe", "windows").is_ok());
+        assert!(validate_update_asset_name("EasyViewer_0.2.3_x64_portable.zip", "windows").is_ok());
+        assert!(validate_update_asset_name("EasyViewer_0.2.3_universal.dmg", "macos").is_ok());
+        assert!(validate_update_asset_name("EasyViewer_0.2.3_amd64.AppImage", "linux").is_ok());
+        assert!(validate_update_asset_name("../evil.exe", "windows").is_err());
+        assert!(validate_update_asset_name("EasyViewer_0.2.3_android.apk", "windows").is_err());
+
+        assert_eq!(
+            normalize_win_dir_key(Path::new(r"\\?\D:\Custom\EasyViewer\")),
+            r"d:\custom\easyviewer"
+        );
+        assert_eq!(
+            detect_windows_install_mode(Path::new(r"D:\Portable\EasyViewer\EasyViewer.exe")),
+            "portable"
+        );
+        // Without a matching MSI registry entry, Program Files alone must not be assumed MSI
+        assert_eq!(
+            detect_windows_install_mode(Path::new(r"C:\Program Files\NonExistentEasyViewer\EasyViewer.exe")),
+            "portable"
+        );
     }
 }
