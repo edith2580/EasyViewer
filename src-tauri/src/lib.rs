@@ -292,7 +292,10 @@ fn normalize_windows_verbatim(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         let s = path.to_string_lossy();
-        if s.len() >= 8 && s[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+        // Compare bytes, not a `&str` slice: `s[..8]` panics when byte 8 falls inside a multi-byte
+        // character (e.g. `\\?\D:\소설`), and a panic inside a command aborts the whole app.
+        // When the 8 bytes match the ASCII prefix, byte 8 is a char boundary, so `s[8..]` is safe.
+        if s.as_bytes().get(..8).is_some_and(|p| p.eq_ignore_ascii_case(br"\\?\UNC\")) {
             return PathBuf::from(format!(r"\\{}", &s[8..]));
         }
         if let Some(rest) = s.strip_prefix(r"\\?\") {
@@ -1648,6 +1651,23 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn normalizes_windows_verbatim_and_unc_paths() {
+        // Regression: byte 8 inside a multi-byte character used to panic and abort the app.
+        assert_eq!(
+            normalize_windows_verbatim(Path::new(r"\\?\D:\소설\책")),
+            PathBuf::from(r"D:\소설\책")
+        );
+        assert_eq!(
+            normalize_windows_verbatim(Path::new(r"D:\소설\책")),
+            PathBuf::from(r"D:\소설\책")
+        );
+        assert_eq!(
+            normalize_windows_verbatim(Path::new(r"\\?\C:\한")),
+            PathBuf::from(r"C:\한")
+        );
+        assert_eq!(
+            normalize_windows_verbatim(Path::new(r"\\?\UNC\나스\공유\책.epub")),
+            PathBuf::from(r"\\나스\공유\책.epub")
+        );
         assert_eq!(
             normalize_windows_verbatim(Path::new(r"\\?\UNC\nas\share\novel.txt")),
             PathBuf::from(r"\\nas\share\novel.txt")
