@@ -31,7 +31,7 @@ const viewModes: Array<{ value: ViewMode; label: string }> = [
 const themes: Array<{ value: ThemeMode; label: string; bgClass: string }> = [
   { value: 'light', label: '라이트', bgClass: 'bg-white text-slate-900 border-slate-300' },
   { value: 'sepia', label: '세피아', bgClass: 'bg-[#f4ecd8] text-[#433422] border-[#d6c3a5]' },
-  { value: 'dark', label: '다크', bgClass: 'bg-slate-900 text-slate-100 border-slate-700' }
+  { value: 'dark', label: '다크', bgClass: 'bg-black text-slate-100 border-slate-700' }
 ]
 
 const fonts: Array<{ value: FontFamilyOption; label: string; previewClass: string }> = [

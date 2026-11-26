@@ -29,7 +29,7 @@ const FONT_STACK_MAP: Record<string, string> = {
 
 const THEME_PALETTE_MAP: Record<string, { bg: string; fg: string; link: string }> = {
   light: { bg: '#ffffff', fg: '#1e293b', link: '#4f46e5' },
-  dark: { bg: '#111827', fg: '#e5e7eb', link: '#818cf8' },
+  dark: { bg: '#000000', fg: '#e5e7eb', link: '#818cf8' }, // pure black, same as --ev-reader-bg
   sepia: { bg: '#f4ecd8', fg: '#433422', link: '#8c5828' }
 }
 
