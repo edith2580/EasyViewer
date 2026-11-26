@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   CONTENT_CSP,
   sanitizeSectionDocument,
+  sanitizeSerializedSection,
   validateEpubArchiveBounds
 } from '@/engines/epub/epubEngine'
 import {
@@ -73,5 +74,73 @@ describe('EPUB sanitizer, Zip Bomb guard, and <base>/CSP compatibility (US3 - TD
     expect(CONTENT_CSP).toContain("default-src 'none'")
     expect(CONTENT_CSP).toContain("base-uri 'none'")
     expect(CONTENT_CSP).toContain("connect-src 'none'")
+  })
+
+  /** What the iframe gets: XHTML parsed as XML, first pass, XMLSerializer, second pass. */
+  function renderLikeEpubJs(xhtml: string): Document {
+    const doc = new DOMParser().parseFromString(xhtml, 'application/xhtml+xml')
+    sanitizeSectionDocument(doc)
+    const serialized = new XMLSerializer().serializeToString(doc)
+    const srcdoc = sanitizeSerializedSection(serialized)
+    // The iframe parses srcdoc with the HTML parser.
+    return new DOMParser().parseFromString(srcdoc, 'text/html')
+  }
+
+  function expectNoActiveContent(doc: Document) {
+    for (const el of Array.from(doc.getElementsByTagName('*'))) {
+      for (const attr of Array.from(el.attributes)) {
+        expect(attr.name.toLowerCase().startsWith('on'), `${el.tagName} ${attr.name}`).toBe(false)
+      }
+    }
+    expect(doc.querySelectorAll('script, iframe, object, embed, noscript')).toHaveLength(0)
+    const first = doc.head.firstElementChild
+    expect(first?.getAttribute('http-equiv')).toBe('Content-Security-Policy')
+    expect(first?.getAttribute('content')).toBe(CONTENT_CSP)
+  }
+
+  const XHTML_HEAD = '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>t</title></head>'
+
+  it('blocks processing-instruction smuggling that becomes live markup after the HTML reparse', () => {
+    const doc = renderLikeEpubJs(
+      `<?xml version="1.0" encoding="utf-8"?>\n<?foo > <img src="x" onerror="parent.pwned=1"> ?>\n${XHTML_HEAD}<body><p>본문</p><?bar > <svg onload="parent.pwned=2"></svg> ?></body></html>`
+    )
+    expectNoActiveContent(doc)
+    expect(doc.body.textContent).toContain('본문')
+  })
+
+  it('blocks doctype system-identifier smuggling', () => {
+    const doc = renderLikeEpubJs(
+      `<?xml version="1.0"?>\n<!DOCTYPE html SYSTEM "x><img src=x onerror=parent.pwned=1>">\n${XHTML_HEAD}<body><p>본문</p></body></html>`
+    )
+    expectNoActiveContent(doc)
+  })
+
+  it('removes noscript, comments and CDATA-based payloads but keeps book content', () => {
+    const doc = renderLikeEpubJs(
+      `${XHTML_HEAD}<body><noscript><p title="&lt;/noscript&gt;&lt;img src=x onerror=parent.pwned=1&gt;">x</p></noscript><!-- --><p id="keep">유지 <a href="ch2.xhtml#s1">다음</a></p><svg xmlns="http://www.w3.org/2000/svg"><style><![CDATA[</style><img src=x onerror=parent.pwned=3>]]></style><circle r="1"/></svg><img id="pic" src="images/a.png" alt="그림"/></body></html>`
+    )
+    expectNoActiveContent(doc)
+    expect(doc.getElementById('keep')?.textContent).toContain('유지')
+    expect(doc.querySelector('a')?.getAttribute('href')).toBe('ch2.xhtml#s1')
+    expect(doc.getElementById('pic')?.getAttribute('src')).toBe('images/a.png')
+    expect(doc.querySelector('svg circle')).not.toBeNull()
+  })
+
+  it('sanitizes raw HTML handed directly to the second pass', () => {
+    // A raw string handed to the second pass directly (e.g. if the first pass were skipped).
+    const out = sanitizeSerializedSection(
+      '<html><head></head><body><p>안전한 글</p><img src=x onerror=parent.pwned=1></body></html>'
+    )
+    const doc = new DOMParser().parseFromString(out, 'text/html')
+    expectNoActiveContent(doc)
+    expect(doc.body.textContent).toContain('안전한 글')
+  })
+
+  it('keeps standards mode when the section had a doctype', () => {
+    const out = sanitizeSerializedSection(
+      '<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head></head><body><p>a</p></body></html>'
+    )
+    expect(out.startsWith('<!DOCTYPE html>')).toBe(true)
+    expect(new DOMParser().parseFromString(out, 'text/html').compatMode).toBe('CSS1Compat')
   })
 })

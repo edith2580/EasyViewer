@@ -1,50 +1,37 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "desktop-library",
-  "description": "Desktop-only storage, dialog, and validated drag-drop capabilities",
+  "description": "Desktop-only storage, dialog, and validated drag-drop capabilities. Book folders outside $APPDATA/books are added at runtime by the allow_storage_dir command; folders are opened through the open_storage_dir command (no webview-wide opener:allow-open-path).",
   "platforms": ["linux", "macOS", "windows"],
   "windows": ["main"],
   "permissions": [
     {
       "identifier": "fs:allow-exists",
-      "allow": [{ "path": "$APPDATA/**" }]
+      "allow": [{ "path": "$APPDATA/books" }, { "path": "$APPDATA/books/**" }]
     },
     {
       "identifier": "fs:allow-stat",
-      "allow": [{ "path": "$APPDATA/**" }]
+      "allow": [{ "path": "$APPDATA/books" }, { "path": "$APPDATA/books/**" }]
     },
     {
       "identifier": "fs:allow-read-file",
-      "allow": [{ "path": "$APPDATA/**" }]
+      "allow": [{ "path": "$APPDATA/books/**" }]
     },
     {
       "identifier": "fs:allow-write-file",
-      "allow": [{ "path": "$APPDATA/**" }]
+      "allow": [{ "path": "$APPDATA/books/**" }]
     },
     {
       "identifier": "fs:allow-mkdir",
-      "allow": [{ "path": "$APPDATA/**" }]
+      "allow": [{ "path": "$APPDATA/books" }, { "path": "$APPDATA/books/**" }]
     },
     {
       "identifier": "fs:allow-rename",
-      "allow": [{ "path": "$APPDATA/**" }]
+      "allow": [{ "path": "$APPDATA/books/**" }]
     },
     {
       "identifier": "fs:allow-remove",
-      "allow": [{ "path": "$APPDATA/**" }]
-    },
-    {
-      "identifier": "opener:allow-open-path",
-      "allow": [
-        { "path": "$APPDATA/**" },
-        { "path": "$HOME/**" }
-      ],
-      "deny": [
-        { "path": "$HOME/.ssh/**" },
-        { "path": "$HOME/.gnupg/**" },
-        { "path": "$HOME/.aws/**" },
-        { "path": "$HOME/.kube/**" }
-      ]
+      "allow": [{ "path": "$APPDATA/books/**" }]
     }
   ]
 }

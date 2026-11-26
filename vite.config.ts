@@ -33,11 +33,43 @@ function easyViewerRemoteProxyPlugin(): Plugin {
   }
 }
 
+/**
+ * The Tauri app gets its Content-Security-Policy from `app.security.csp` in tauri.conf.json, but
+ * the plain web build (static hosting, `vite preview`) had none, so a script that got past the
+ * EPUB sanitizer could reach the whole app origin. For web builds the same policy is injected as a
+ * `<meta>` tag; `connect-src` additionally allows http(s) because the web build fetches remote
+ * books directly when no proxy is available. Tauri builds (TAURI_ENV_PLATFORM is set by the Tauri
+ * CLI for beforeBuildCommand) are left untouched. `vite` dev serve is not covered (HMR needs
+ * inline styles and a websocket).
+ */
+function buildWebCspMeta(): string {
+  const conf = JSON.parse(
+    fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf-8')
+  ) as { app?: { security?: { csp?: Record<string, string> } } }
+  const csp = { ...(conf.app?.security?.csp ?? {}) }
+  csp['connect-src'] = `${csp['connect-src'] ?? "'self'"} https: http:`
+  const policy = Object.entries(csp)
+    .map(([directive, value]) => `${directive} ${value}`)
+    .join('; ')
+  return `<meta http-equiv="Content-Security-Policy" content="${policy.replace(/"/g, '&quot;')}">`
+}
+
+function easyViewerWebCspPlugin(): Plugin {
+  return {
+    name: 'easyviewer-web-csp',
+    apply: 'build',
+    transformIndexHtml(html) {
+      if (process.env.TAURI_ENV_PLATFORM) return html
+      return html.replace('<head>', `<head>\n    ${buildWebCspMeta()}`)
+    }
+  }
+}
+
 export default defineConfig({
   define: {
     __APP_VERSION__: JSON.stringify(APP_VERSION)
   },
-  plugins: [vue(), easyViewerRemoteProxyPlugin()],
+  plugins: [vue(), easyViewerRemoteProxyPlugin(), easyViewerWebCspPlugin()],
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url))

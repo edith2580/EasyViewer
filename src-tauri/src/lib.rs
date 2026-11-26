@@ -25,6 +25,9 @@ const CONNECT_TIMEOUT_SECS: u64 = 10;
 struct AppSecurityState {
     approved_storage_dirs: Mutex<HashSet<PathBuf>>,
     approved_drop_paths: Mutex<HashSet<PathBuf>>,
+    /// `Some(true)` while the one-time migration of storage folders chosen by older versions is
+    /// open (no persisted approval file existed at first use); `None` = not determined yet.
+    storage_bootstrap_open: Mutex<Option<bool>>,
 }
 
 struct PinnedSsrfResolver {
@@ -398,14 +401,97 @@ pub fn compute_remaining_budget(deadline: Instant, now: Instant) -> Result<Durat
     Ok(deadline.saturating_duration_since(now))
 }
 
+/// OS program/system folders that must never become a writable book folder (Windows env-based).
+fn system_storage_deny_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    #[cfg(windows)]
+    for var in [
+        "SystemRoot",
+        "windir",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "ProgramData",
+    ] {
+        if let Some(v) = std::env::var_os(var) {
+            dirs.push(PathBuf::from(v));
+        }
+    }
+    #[cfg(not(windows))]
+    for p in ["/Applications", "/usr", "/bin", "/sbin", "/boot", "/lib", "/lib64", "/opt"] {
+        dirs.push(PathBuf::from(p));
+    }
+    dirs
+}
+
+/// Storage-folder-only deny rules on top of [`is_sensitive_path`]. A storage folder becomes
+/// readable *and writable* by the webview, so places where a written file gets executed or
+/// trusted are refused: filesystem/drive roots, the home folder itself, hidden folders directly in
+/// home (`.config/autostart`, `.local`, …), `~/AppData` (Windows Startup folder and other apps'
+/// data) and `~/Library` (macOS LaunchAgents) except this app's own data folder, and OS program
+/// folders.
+pub fn is_forbidden_storage_dir_with(
+    path: &Path,
+    home_dir: Option<&Path>,
+    app_data_dir: Option<&Path>,
+    system_dirs: &[PathBuf],
+    case_insensitive: bool,
+) -> bool {
+    if path.parent().is_none() || path.file_name().is_none() {
+        return true;
+    }
+    if system_dirs
+        .iter()
+        .any(|d| matches_path_prefix(path, d, case_insensitive))
+    {
+        return true;
+    }
+    let in_app_data =
+        app_data_dir.is_some_and(|d| matches_path_prefix(path, d, case_insensitive));
+    if let Some(home) = home_dir {
+        if matches_path_prefix(home, path, case_insensitive) {
+            // `path` is the home folder or one of its ancestors.
+            return true;
+        }
+        if matches_path_prefix(path, home, case_insensitive) {
+            let home_len = home.components().count();
+            if let Some(Component::Normal(first)) = path.components().nth(home_len) {
+                let first = first.to_string_lossy();
+                if first.starts_with('.') {
+                    return true;
+                }
+                let protected = ["AppData", "Library"]
+                    .iter()
+                    .any(|p| if case_insensitive { first.eq_ignore_ascii_case(p) } else { first == *p });
+                if protected && !in_app_data {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn is_denied_storage_dir(path: &Path, home_dir: Option<&Path>, app_data_dir: Option<&Path>) -> bool {
+    is_sensitive_path(path, home_dir)
+        || is_forbidden_storage_dir_with(
+            path,
+            home_dir,
+            app_data_dir,
+            &system_storage_deny_dirs(),
+            cfg!(any(target_os = "macos", target_os = "windows")),
+        )
+}
+
 /// Walks up to the nearest existing ancestor, canonicalizes it to catch symlink escapes before
 /// `create_dir_all`, verifies neither ancestor nor created path is sensitive, and returns canonical dir.
 pub fn validate_and_prepare_storage_dir(
     raw_path: &str,
     home_dir: Option<&Path>,
+    app_data_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let dir = validate_storage_dir_path(raw_path)?;
-    if is_sensitive_path(&dir, home_dir) {
+    if is_denied_storage_dir(&dir, home_dir, app_data_dir) {
         return Err(format!(
             "SECURITY_DENIED: 시스템 또는 자격 증명 보호 경로는 저장소로 허용되지 않습니다: {raw_path}"
         ));
@@ -432,7 +518,7 @@ pub fn validate_and_prepare_storage_dir(
     if !canonical_final.is_dir() {
         return Err(format!("INVALID_DIR: 디렉토리가 아닙니다: {raw_path}"));
     }
-    if is_sensitive_path(&canonical_final, home_dir) {
+    if is_denied_storage_dir(&canonical_final, home_dir, app_data_dir) {
         return Err(format!(
             "SECURITY_DENIED: 생성된 경로가 민감 영역으로 해석되어 거부되었습니다: {raw_path}"
         ));
@@ -640,7 +726,11 @@ fn get_install_mode() -> String {
     }
 }
 
-const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/edith2580/EasyViewer/releases/download/";
+const RELEASE_HOST: &str = "github.com";
+const RELEASE_DOWNLOAD_PATH_PREFIX: &str = "/edith2580/EasyViewer/releases/download/";
+const LATEST_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/edith2580/EasyViewer/releases/latest";
+const MAX_RELEASE_API_BYTES: usize = 2 * 1024 * 1024;
 const ALLOWED_UPDATE_HOSTS: &[&str] = &[
     "github.com",
     "objects.githubusercontent.com",
@@ -648,16 +738,149 @@ const ALLOWED_UPDATE_HOSTS: &[&str] = &[
     "github-releases.githubusercontent.com",
 ];
 
-pub fn validate_release_download_url(raw_url: &str) -> Result<Url, String> {
+/// Decodes `%XX` escapes of a single URL path segment (no `+` handling: paths keep `+` literal).
+fn percent_decode_segment(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = segment.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Accepts only `https://github.com/edith2580/EasyViewer/releases/download/<tag>/<asset>`.
+/// The check runs on the *parsed* URL (dot segments such as `../../other/repo` are resolved by
+/// the parser), and raw dot segments / backslashes are rejected outright. Returns the URL and the
+/// decoded asset file name from its last path segment.
+pub fn validate_release_download_url(raw_url: &str) -> Result<(Url, String), String> {
     let trimmed = raw_url.trim();
-    if !trimmed.starts_with(RELEASE_DOWNLOAD_PREFIX) {
-        return Err("SECURITY_DENIED: 허용되지 않은 업데이트 다운로드 출처입니다.".into());
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("/..") || lower.contains("/%2e") || lower.contains('\\') {
+        return Err("SECURITY_DENIED: 업데이트 URL에 상대 경로 구간을 사용할 수 없습니다.".into());
     }
     let parsed = validate_url_syntax(trimmed)?;
     if parsed.scheme() != "https" {
         return Err("SECURITY_DENIED: HTTPS 업데이트 URL만 허용됩니다.".into());
     }
-    Ok(parsed)
+    if parsed.host_str() != Some(RELEASE_HOST) || parsed.port().is_some() {
+        return Err("SECURITY_DENIED: 허용되지 않은 업데이트 다운로드 출처입니다.".into());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("SECURITY_DENIED: 업데이트 URL에 쿼리나 프래그먼트를 사용할 수 없습니다.".into());
+    }
+    let rest = parsed
+        .path()
+        .strip_prefix(RELEASE_DOWNLOAD_PATH_PREFIX)
+        .ok_or_else(|| "SECURITY_DENIED: 허용되지 않은 업데이트 다운로드 출처입니다.".to_string())?;
+    let segments: Vec<&str> = rest.split('/').collect();
+    if segments.len() != 2 || segments.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
+        return Err("SECURITY_DENIED: 업데이트 URL 형식이 올바르지 않습니다.".into());
+    }
+    let asset = percent_decode_segment(segments[1])
+        .ok_or_else(|| "SECURITY_DENIED: 업데이트 파일 이름을 해석할 수 없습니다.".to_string())?;
+    Ok((parsed, asset))
+}
+
+/// Parses a GitHub release asset `digest` (`sha256:<64 hex>`) into lowercase hex.
+pub fn parse_sha256_digest(raw: &str) -> Result<String, String> {
+    let hex = raw
+        .trim()
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "UPDATE_INTEGRITY_UNAVAILABLE: 지원하지 않는 해시 형식입니다.".to_string())?
+        .to_ascii_lowercase();
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("UPDATE_INTEGRITY_UNAVAILABLE: SHA-256 해시 형식이 올바르지 않습니다.".into());
+    }
+    Ok(hex)
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[cfg_attr(mobile, allow(dead_code))]
+#[derive(Debug, Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    size: Option<u64>,
+    digest: Option<String>,
+}
+
+#[cfg_attr(mobile, allow(dead_code))]
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    #[serde(default)]
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+/// Picks the asset the frontend asked for out of the official latest release and returns its
+/// expected SHA-256 and size. The download URL must match the API's `browser_download_url`.
+#[cfg_attr(mobile, allow(dead_code))]
+fn find_release_asset_digest(
+    release: &GitHubRelease,
+    download_url: &Url,
+    asset_name: &str,
+) -> Result<(String, Option<u64>), String> {
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| {
+            a.name == asset_name
+                && Url::parse(&a.browser_download_url).is_ok_and(|u| u == *download_url)
+        })
+        .ok_or_else(|| {
+            "SECURITY_DENIED: 최신 공식 릴리즈에 없는 업데이트 파일입니다.".to_string()
+        })?;
+    let digest = asset.digest.as_deref().ok_or_else(|| {
+        "UPDATE_INTEGRITY_UNAVAILABLE: 릴리즈 파일의 SHA-256 해시를 확인할 수 없어 자동 설치를 중단했습니다. 릴리즈 페이지에서 직접 받아 주세요."
+            .to_string()
+    })?;
+    Ok((parse_sha256_digest(digest)?, asset.size))
+}
+
+/// Fetches the latest release metadata from the GitHub API in Rust (not from the webview), so the
+/// expected hash comes over a separate TLS channel from the download itself.
+#[cfg(desktop)]
+async fn fetch_latest_release(client: &reqwest::Client) -> Result<GitHubRelease, String> {
+    let mut resp = client
+        .get(LATEST_RELEASE_API_URL)
+        .header("User-Agent", "EasyViewer-Updater")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("UPDATE_CHECK_FAILED: 릴리즈 정보를 가져오지 못했습니다: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "UPDATE_CHECK_FAILED: 릴리즈 정보 응답 오류 (HTTP {})",
+            resp.status().as_u16()
+        ));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("UPDATE_CHECK_FAILED: 릴리즈 정보 수신 실패: {e}"))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RELEASE_API_BYTES {
+            return Err("UPDATE_CHECK_FAILED: 릴리즈 정보 응답이 너무 큽니다.".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body)
+        .map_err(|e| format!("UPDATE_CHECK_FAILED: 릴리즈 정보 형식 오류: {e}"))
 }
 
 pub fn validate_update_asset_name(asset_name: &str, os: &str) -> Result<String, String> {
@@ -693,8 +916,11 @@ async fn install_release_update(
     download_url: String,
     asset_name: String,
 ) -> Result<String, String> {
-    let initial_url = validate_release_download_url(&download_url)?;
+    let (initial_url, url_asset_name) = validate_release_download_url(&download_url)?;
     let safe_name = validate_update_asset_name(&asset_name, std::env::consts::OS)?;
+    if url_asset_name != safe_name {
+        return Err("SECURITY_DENIED: 업데이트 파일 이름과 다운로드 URL이 일치하지 않습니다.".into());
+    }
 
     let client = reqwest::Client::builder()
         .redirect(Policy::none())
@@ -702,6 +928,12 @@ async fn install_release_update(
         .timeout(Duration::from_secs(180))
         .build()
         .map_err(|e| format!("HTTP_CLIENT_ERROR: {e}"))?;
+
+    // The webview only names the asset; its expected hash comes from the official release
+    // metadata fetched here, and the downloaded bytes must match it before anything is run.
+    let release = fetch_latest_release(&client).await?;
+    let (expected_sha256, expected_size) =
+        find_release_asset_digest(&release, &initial_url, &safe_name)?;
 
     let mut current_url = initial_url;
     let mut final_response = None;
@@ -775,6 +1007,18 @@ async fn install_release_update(
             return Err("RESPONSE_TOO_LARGE: 업데이트 파일 크기가 허용 상한을 초과했습니다.".into());
         }
         acc.extend_from_slice(&chunk);
+    }
+
+    if let Some(size) = expected_size {
+        if acc.len() as u64 != size {
+            return Err("UPDATE_INTEGRITY_FAILED: 업데이트 파일 크기가 릴리즈 정보와 다릅니다.".into());
+        }
+    }
+    if sha256_hex(&acc) != expected_sha256 {
+        return Err(
+            "UPDATE_INTEGRITY_FAILED: 업데이트 파일의 SHA-256 해시가 릴리즈 정보와 일치하지 않아 설치를 중단했습니다."
+                .into(),
+        );
     }
 
     std::fs::write(&dest_path, &acc)
@@ -926,8 +1170,81 @@ async fn install_release_update(
     Ok(dest_path.to_string_lossy().to_string())
 }
 
+#[cfg_attr(mobile, allow(dead_code))]
+const CASE_INSENSITIVE_FS: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+
+#[cfg(desktop)]
+fn approved_storage_dirs_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|d| d.join("approved_storage_dirs.json"))
+        .map_err(|e| format!("PATH_ERROR: 앱 설정 폴더를 확인할 수 없습니다: {e}"))
+}
+
+/// Storage folders the user chose (through the folder dialog) in earlier runs. `None` when the
+/// file does not exist yet; an unreadable or corrupt file counts as an empty list (fail closed).
+pub fn load_persisted_storage_dirs(file: &Path) -> Option<Vec<PathBuf>> {
+    match std::fs::read_to_string(file) {
+        Ok(text) => Some(
+            serde_json::from_str::<Vec<String>>(&text)
+                .map(|list| list.into_iter().map(PathBuf::from).collect())
+                .unwrap_or_default(),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(Vec::new()),
+    }
+}
+
+#[cfg_attr(mobile, allow(dead_code))]
+fn save_persisted_storage_dirs(file: &Path, dirs: &[PathBuf]) -> Result<(), String> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("STATE_SAVE_FAILED: {e}"))?;
+    }
+    let list: Vec<String> = dirs.iter().map(|d| d.to_string_lossy().to_string()).collect();
+    let json = serde_json::to_string_pretty(&list).map_err(|e| format!("STATE_SAVE_FAILED: {e}"))?;
+    std::fs::write(file, json).map_err(|e| format!("STATE_SAVE_FAILED: {e}"))
+}
+
+#[cfg_attr(mobile, allow(dead_code))]
+fn is_covered_by_any(path: &Path, dirs: &[PathBuf]) -> bool {
+    dirs.iter()
+        .any(|d| matches_path_prefix(path, &normalize_windows_verbatim(d), CASE_INSENSITIVE_FS))
+}
+
+/// Whether the one-time storage-folder migration window is open. It is open only when no
+/// approval file existed the first time this run looked, and closes at `seal_storage_dirs`.
+#[cfg(desktop)]
+fn storage_bootstrap_open(state: &AppSecurityState, file: &Path) -> Result<bool, String> {
+    let mut guard = state
+        .storage_bootstrap_open
+        .lock()
+        .map_err(|_| "STATE_LOCK_ERROR: 저장소 잠금 실패".to_string())?;
+    Ok(*guard.get_or_insert_with(|| !file.exists()))
+}
+
+/// A storage folder is accepted only when the user chose it: it is (inside) the default
+/// `<app data>/books` folder, inside a folder approved in an earlier run, or was just picked in
+/// the native folder dialog (the dialog plugin adds the picked folder to the fs scope; the webview
+/// cannot do that on its own). Folders remembered by older versions are accepted once, during the
+/// migration window.
+#[cfg(desktop)]
+fn is_storage_dir_user_approved(
+    app: &tauri::AppHandle,
+    candidate: &Path,
+    default_dir: &Path,
+    persisted: &[PathBuf],
+    bootstrap_open: bool,
+) -> bool {
+    bootstrap_open
+        || matches_path_prefix(candidate, default_dir, CASE_INSENSITIVE_FS)
+        || is_covered_by_any(candidate, persisted)
+        || app.fs_scope().is_allowed(candidate)
+}
+
 /// Creates `path` if needed after ancestor canonicalization & deny-list checks and registers it
-/// in both the Rust Zero-Trust whitelist and the Tauri fs scope for this run.
+/// in both the Rust Zero-Trust whitelist and the Tauri fs scope for this run. The folder must have
+/// been chosen by the user (see [`is_storage_dir_user_approved`]); it is then remembered in
+/// `approved_storage_dirs.json` so it can be re-allowed on later starts.
 #[cfg(desktop)]
 #[tauri::command]
 fn allow_storage_dir(
@@ -935,7 +1252,42 @@ fn allow_storage_dir(
     state: tauri::State<'_, AppSecurityState>,
     path: String,
 ) -> Result<(), String> {
-    let canonical = validate_and_prepare_storage_dir(&path, user_home_dir().as_deref())?;
+    let home = user_home_dir();
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("PATH_ERROR: 앱 데이터 폴더를 확인할 수 없습니다: {e}"))?;
+    let default_dir = app_data.join("books");
+    let file = approved_storage_dirs_file(&app)?;
+    let mut persisted = load_persisted_storage_dirs(&file).unwrap_or_default();
+    let bootstrap = storage_bootstrap_open(&state, &file)?;
+
+    let raw = validate_storage_dir_path(&path)?;
+    let raw_check = resolve_existing_path(&raw).unwrap_or_else(|_| raw.clone());
+    if !is_storage_dir_user_approved(&app, &raw, &default_dir, &persisted, bootstrap)
+        && !is_storage_dir_user_approved(&app, &raw_check, &default_dir, &persisted, bootstrap)
+    {
+        return Err(
+            "SECURITY_DENIED: 저장 폴더는 폴더 선택 대화상자에서 직접 고른 폴더만 사용할 수 있습니다."
+                .into(),
+        );
+    }
+
+    let canonical = validate_and_prepare_storage_dir(&path, home.as_deref(), Some(&app_data))?;
+    let canonical_default = resolve_existing_path(&default_dir).unwrap_or(default_dir.clone());
+    if !is_storage_dir_user_approved(&app, &canonical, &canonical_default, &persisted, bootstrap)
+        && !is_storage_dir_user_approved(&app, &canonical, &default_dir, &persisted, bootstrap)
+    {
+        return Err("SECURITY_DENIED: 저장 폴더가 승인되지 않은 위치로 해석되었습니다.".into());
+    }
+
+    if !matches_path_prefix(&canonical, &canonical_default, CASE_INSENSITIVE_FS)
+        && !is_covered_by_any(&canonical, &persisted)
+    {
+        persisted.push(canonical.clone());
+        save_persisted_storage_dirs(&file, &persisted)?;
+    }
+
     {
         let mut dirs = state
             .approved_storage_dirs
@@ -946,6 +1298,61 @@ fn allow_storage_dir(
     app.fs_scope()
         .allow_directory(&canonical, true)
         .map_err(|e| e.to_string())
+}
+
+/// Closes the one-time migration window for storage folders remembered by older versions.
+/// Called by the frontend right after it re-allowed the library's folders at startup.
+#[cfg(desktop)]
+#[tauri::command]
+fn seal_storage_dirs(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppSecurityState>,
+) -> Result<(), String> {
+    let file = approved_storage_dirs_file(&app)?;
+    {
+        let mut guard = state
+            .storage_bootstrap_open
+            .lock()
+            .map_err(|_| "STATE_LOCK_ERROR: 저장소 잠금 실패".to_string())?;
+        *guard = Some(false);
+    }
+    if !file.exists() {
+        save_persisted_storage_dirs(&file, &[])?;
+    }
+    Ok(())
+}
+
+/// Opens an approved storage folder in Explorer / Finder. Replaces the webview-wide
+/// `opener:allow-open-path` permission, which let any script open (and so run) any file under
+/// `$HOME` or `$APPDATA`; this only ever opens a directory already approved in this run.
+#[cfg(desktop)]
+#[tauri::command]
+fn open_storage_dir(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppSecurityState>,
+    path: String,
+) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+
+    let raw = validate_storage_dir_path(&path)?;
+    let canonical = resolve_existing_path(&raw)
+        .map_err(|e| format!("INVALID_DIR: 폴더를 찾을 수 없습니다: {e}"))?;
+    if !canonical.is_dir() {
+        return Err("INVALID_DIR: 폴더만 열 수 있습니다.".into());
+    }
+    let approved: Vec<PathBuf> = state
+        .approved_storage_dirs
+        .lock()
+        .map_err(|_| "STATE_LOCK_ERROR: 저장소 잠금 실패".to_string())?
+        .iter()
+        .cloned()
+        .collect();
+    if !is_covered_by_any(&canonical, &approved) {
+        return Err("SECURITY_DENIED: 승인된 저장 폴더만 열 수 있습니다.".into());
+    }
+    app.opener()
+        .open_path(canonical.to_string_lossy().to_string(), None::<String>)
+        .map_err(|e| format!("OPEN_FAILED: {e}"))
 }
 
 /// Reads a validated local `.txt` or `.epub` book file as binary `tauri::ipc::Response` (desktop only).
@@ -1201,6 +1608,8 @@ pub fn run() {
             get_platform_os,
             get_install_mode,
             allow_storage_dir,
+            seal_storage_dirs,
+            open_storage_dir,
             read_validated_book_file,
             safe_remote_fetch,
             install_release_update
@@ -1367,14 +1776,14 @@ mod tests {
             "/private/etc",
         ] {
             assert!(
-                validate_and_prepare_storage_dir(blocked, Some(&fake_home)).is_err(),
+                validate_and_prepare_storage_dir(blocked, Some(&fake_home), None).is_err(),
                 "Expected {blocked} to be rejected"
             );
         }
         for cred in [".ssh", ".gnupg", ".aws", ".kube"] {
             let p = fake_home.join(cred).join("sub");
             assert!(
-                validate_and_prepare_storage_dir(p.to_str().unwrap(), Some(&fake_home)).is_err(),
+                validate_and_prepare_storage_dir(p.to_str().unwrap(), Some(&fake_home), None).is_err(),
                 "Expected credential path {cred} to be rejected"
             );
         }
@@ -1382,7 +1791,7 @@ mod tests {
         // 2. Nonexistent leaf under safe ancestor succeeds, whereas symlink-to-/etc escape fails before create_dir_all
         let nested_safe = sandbox_root.join("books").join("nested-leaf");
         let prepared =
-            validate_and_prepare_storage_dir(nested_safe.to_str().unwrap(), Some(&fake_home))
+            validate_and_prepare_storage_dir(nested_safe.to_str().unwrap(), Some(&fake_home), None)
                 .expect("safe nested storage folder should be prepared");
         assert!(prepared.is_dir());
 
@@ -1392,7 +1801,7 @@ mod tests {
             std::os::unix::fs::symlink("/etc", &link_escape).unwrap();
             let attempt = link_escape.join("should-not-exist");
             assert!(
-                validate_and_prepare_storage_dir(attempt.to_str().unwrap(), Some(&fake_home))
+                validate_and_prepare_storage_dir(attempt.to_str().unwrap(), Some(&fake_home), None)
                     .is_err()
             );
         }
@@ -1556,6 +1965,134 @@ mod tests {
         let expired_past =
             compute_remaining_budget(deadline, deadline + Duration::from_millis(5)).unwrap_err();
         assert!(expired_past.contains("TIMEOUT:"));
+    }
+
+    #[test]
+    fn release_download_url_rejects_dot_segment_and_host_tricks() {
+        let (url, asset) = validate_release_download_url(
+            "https://github.com/edith2580/EasyViewer/releases/download/v0.2.4/EasyViewer_0.2.4_x64%20setup.exe",
+        )
+        .unwrap();
+        assert_eq!(url.host_str(), Some("github.com"));
+        assert_eq!(asset, "EasyViewer_0.2.4_x64 setup.exe");
+
+        for bad in [
+            // Prefix matches as a raw string, but the parser resolves it to another repository.
+            "https://github.com/edith2580/EasyViewer/releases/download/../../../../evil/repo/releases/download/v1/EasyViewer-setup.exe",
+            "https://github.com/edith2580/EasyViewer/releases/download/%2e%2e/%2e%2e/%2e%2e/%2e%2e/evil/repo/releases/download/v1/x.exe",
+            "https://github.com/edith2580/EasyViewer/releases/download/v1\\..\\..\\x.exe",
+            "https://github.com.evil.example/edith2580/EasyViewer/releases/download/v1/x.exe",
+            "https://github.com:8443/edith2580/EasyViewer/releases/download/v1/x.exe",
+            "https://user@github.com/edith2580/EasyViewer/releases/download/v1/x.exe",
+            "https://github.com/edith2580/EasyViewer/releases/download/v1/x.exe?redirect=evil",
+            "https://github.com/edith2580/EasyViewer/releases/download/v1/sub/x.exe",
+            "https://github.com/edith2580/EasyViewer/releases/download/x.exe",
+            "https://github.com/edith2580/OtherRepo/releases/download/v1/x.exe",
+        ] {
+            assert!(validate_release_download_url(bad).is_err(), "should reject {bad}");
+        }
+    }
+
+    #[test]
+    fn release_asset_digest_must_come_from_official_release_metadata() {
+        let body = r#"{"assets":[
+            {"name":"EasyViewer_0.2.5_x64-setup.exe","size":3,
+             "browser_download_url":"https://github.com/edith2580/EasyViewer/releases/download/v0.2.5/EasyViewer_0.2.5_x64-setup.exe",
+             "digest":"sha256:BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"},
+            {"name":"EasyViewer_0.2.5_x64_portable.zip","size":1,
+             "browser_download_url":"https://github.com/edith2580/EasyViewer/releases/download/v0.2.5/EasyViewer_0.2.5_x64_portable.zip",
+             "digest":null}
+        ]}"#;
+        let release: GitHubRelease = serde_json::from_str(body).unwrap();
+        let (setup_url, setup_name) = validate_release_download_url(
+            "https://github.com/edith2580/EasyViewer/releases/download/v0.2.5/EasyViewer_0.2.5_x64-setup.exe",
+        )
+        .unwrap();
+        let (hash, size) = find_release_asset_digest(&release, &setup_url, &setup_name).unwrap();
+        assert_eq!(size, Some(3));
+        assert_eq!(hash, sha256_hex(b"abc"));
+
+        // Asset without a published digest: fail closed.
+        let (zip_url, zip_name) = validate_release_download_url(
+            "https://github.com/edith2580/EasyViewer/releases/download/v0.2.5/EasyViewer_0.2.5_x64_portable.zip",
+        )
+        .unwrap();
+        assert!(find_release_asset_digest(&release, &zip_url, &zip_name)
+            .unwrap_err()
+            .starts_with("UPDATE_INTEGRITY_UNAVAILABLE"));
+
+        // Asset that is not in the official release (or under another name): rejected.
+        let (other_url, _) = validate_release_download_url(
+            "https://github.com/edith2580/EasyViewer/releases/download/v0.1.0/EasyViewer_0.2.5_x64-setup.exe",
+        )
+        .unwrap();
+        assert!(find_release_asset_digest(&release, &other_url, &setup_name).is_err());
+        assert!(find_release_asset_digest(&release, &setup_url, "renamed.exe").is_err());
+
+        assert!(parse_sha256_digest("sha1:abcd").is_err());
+        assert!(parse_sha256_digest("sha256:xyz").is_err());
+    }
+
+    #[test]
+    fn forbidden_storage_dirs_cover_autostart_program_and_home_locations() {
+        let (home, app_data, system) = if cfg!(windows) {
+            (
+                PathBuf::from(r"C:\Users\me"),
+                PathBuf::from(r"C:\Users\me\AppData\Roaming\com.edith.easyviewer"),
+                vec![PathBuf::from(r"C:\Windows"), PathBuf::from(r"C:\Program Files")],
+            )
+        } else {
+            (
+                PathBuf::from("/Users/me"),
+                PathBuf::from("/Users/me/Library/Application Support/com.edith.easyviewer"),
+                vec![PathBuf::from("/Applications"), PathBuf::from("/usr")],
+            )
+        };
+        let denied = |p: &Path| {
+            is_forbidden_storage_dir_with(p, Some(&home), Some(&app_data), &system, true)
+        };
+
+        let startup = if cfg!(windows) {
+            home.join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup")
+        } else {
+            home.join("Library/LaunchAgents")
+        };
+        assert!(denied(&startup));
+        assert!(denied(&home));
+        assert!(denied(home.parent().unwrap()));
+        assert!(denied(&home.join(".config").join("autostart")));
+        assert!(denied(&system[0].join("System32")));
+        assert!(denied(&system[1].join("EasyViewer")));
+        if cfg!(windows) {
+            assert!(denied(Path::new(r"D:\")));
+            assert!(denied(&home.join(r"appdata\local\Google\Chrome")));
+        } else {
+            assert!(denied(Path::new("/")));
+        }
+
+        assert!(!denied(&app_data.join("books")));
+        assert!(!denied(&home.join("Documents").join("Novels")));
+        if cfg!(windows) {
+            assert!(!denied(Path::new(r"D:\Books")));
+        }
+    }
+
+    #[test]
+    fn persisted_storage_dir_file_fails_closed_when_corrupt() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("unit-test-approved-dirs");
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("approved_storage_dirs.json");
+        assert!(load_persisted_storage_dirs(&file).is_none());
+
+        save_persisted_storage_dirs(&file, &[dir.join("books")]).unwrap();
+        assert_eq!(load_persisted_storage_dirs(&file).unwrap(), vec![dir.join("books")]);
+        assert!(is_covered_by_any(&dir.join("books").join("sub"), &[dir.join("books")]));
+        assert!(!is_covered_by_any(&dir.join("other"), &[dir.join("books")]));
+
+        std::fs::write(&file, "not json").unwrap();
+        assert_eq!(load_persisted_storage_dirs(&file), Some(Vec::new()));
     }
 
     #[test]

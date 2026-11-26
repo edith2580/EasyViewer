@@ -66,9 +66,14 @@ describe('PlatformStorageAdapter & initLibrary IPC characterization', () => {
     const allowCalls = calls.filter((c) => c.cmd === 'allow_storage_dir')
     // All 12 books live in the same directory (+ 1 default dir), so Set deduplication keeps allow_storage_dir <= 2
     expect(allowCalls.length).toBeLessThanOrEqual(2)
+
+    // The one-time migration window for previously chosen folders is closed right after.
+    const cmds = calls.map((c) => c.cmd)
+    expect(cmds).toContain('seal_storage_dirs')
+    expect(cmds.indexOf('seal_storage_dirs')).toBeGreaterThan(cmds.lastIndexOf('allow_storage_dir'))
   })
 
-  it('validates storage dir with allow_storage_dir before opening via @tauri-apps/plugin-opener (T066)', async () => {
+  it('validates storage dir with allow_storage_dir before opening via the native open_storage_dir command (T066)', async () => {
     vi.resetModules()
     const calls: string[] = []
     mockIPC((cmd) => {
@@ -76,7 +81,7 @@ describe('PlatformStorageAdapter & initLibrary IPC characterization', () => {
       if (cmd === 'plugin:path|resolve_directory') return '/Users/tester/Library/Application Support/EasyViewer'
       if (cmd === 'plugin:path|join') return '/Users/tester/Books'
       if (cmd === 'allow_storage_dir') return null
-      if (cmd === 'plugin:opener|open_path') return null
+      if (cmd === 'open_storage_dir') return null
       return null
     })
 
@@ -84,9 +89,9 @@ describe('PlatformStorageAdapter & initLibrary IPC characterization', () => {
     await platformStorage.openStorageDir()
     expect(calls).not.toContain('open_folder')
     expect(calls.indexOf('allow_storage_dir')).toBeGreaterThanOrEqual(0)
-    expect(calls.indexOf('plugin:opener|open_path')).toBeGreaterThan(
-      calls.indexOf('allow_storage_dir')
-    )
+    // The webview no longer opens paths itself (opener:allow-open-path was removed).
+    expect(calls).not.toContain('plugin:opener|open_path')
+    expect(calls.indexOf('open_storage_dir')).toBeGreaterThan(calls.indexOf('allow_storage_dir'))
 
     vi.resetModules()
     const blockedCalls: string[] = []
@@ -97,12 +102,12 @@ describe('PlatformStorageAdapter & initLibrary IPC characterization', () => {
       if (cmd === 'allow_storage_dir') {
         throw new Error('SECURITY_DENIED: sensitive path')
       }
-      if (cmd === 'plugin:opener|open_path') return null
+      if (cmd === 'open_storage_dir') return null
       return null
     })
 
     const { platformStorage: blockedStorage } = await import('@/services/storage/platformAdapter')
     await expect(blockedStorage.openStorageDir()).rejects.toThrow('SECURITY_DENIED')
-    expect(blockedCalls).not.toContain('plugin:opener|open_path')
+    expect(blockedCalls).not.toContain('open_storage_dir')
   })
 })

@@ -66,13 +66,19 @@ function collapseCfiString(cfiStr: string, toStart = true): string {
  * click or touch inside the book ever reached the reader (center-tap menu, tap-to-turn pages, and
  * epub.js's own in-book link handling were all dead), while Chromium happened to work.
  *
- * The rendition is therefore created with `allowScriptedContent: true`, and every section document
- * is sanitized before it is serialized into the iframe:
- *  - a Content-Security-Policy `<meta>` (script-src 'none', …) is inserted first in <head>, which
- *    blocks inline scripts, event-handler attributes and `javascript:` URLs in the book;
- *  - script/iframe/object/embed-like elements, `on*` attributes, `javascript:` URLs and meta
- *    refreshes are removed as a second line of defense.
- * Listeners added by this app are parent-page functions, which CSP does not block.
+ * The rendition is therefore created with `allowScriptedContent: true`, and every section is
+ * sanitized twice:
+ *  1. `sanitizeSectionDocument` on the parsed XHTML document (spine content hook);
+ *  2. `sanitizeSerializedSection` on the final markup string (spine serialize hook). epub.js
+ *     serializes the XML document and the iframe parses that string with the *HTML* parser
+ *     (`srcdoc`), which reads some XML constructs differently — e.g. a processing instruction
+ *     `<?x > <img onerror=…> ?>` is a harmless PI in XML but becomes a live `<img>` in HTML. So the
+ *     markup is parsed as HTML exactly like the iframe will, sanitized again, re-serialized, and
+ *     verified once more; anything that still fails verification is rendered as plain text.
+ * Both passes insert a Content-Security-Policy `<meta>` (script-src 'none', …) first in <head>,
+ * which blocks inline scripts, event-handler attributes and `javascript:` URLs, and remove
+ * script/iframe/object/embed-like elements, `on*` attributes, `javascript:` URLs and meta
+ * refreshes. Listeners added by this app are parent-page functions, which CSP does not block.
  */
 export const CONTENT_CSP =
   "default-src 'none'; script-src 'none'; object-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; form-action 'none'; base-uri 'none'; connect-src 'none'; style-src 'self' 'unsafe-inline' blob: data:; img-src 'self' blob: data:; font-src 'self' blob: data:"
@@ -92,6 +98,9 @@ const ACTIVE_ELEMENTS = new Set([
   'applet',
   'portal',
   'base',
+  // Parsed as raw text when scripting is enabled (as in the iframe) but as markup by DOMParser,
+  // a classic mutation-XSS vector; it has no use in a book rendered with scripts on anyway.
+  'noscript',
   'foreignobject',
   'use',
   'animate',
@@ -165,19 +174,59 @@ export async function validateEpubArchiveBounds(buffer: ArrayBuffer): Promise<vo
   }
 }
 
-export function sanitizeSectionDocument(doc: Document): void {
-  const root = doc?.documentElement
-  if (!root) return
+const NODE_CDATA_SECTION = 4
+const NODE_PROCESSING_INSTRUCTION = 7
+const NODE_COMMENT = 8
+const NODE_DOCUMENT_TYPE = 10
+
+/**
+ * Removes markup that the HTML parser reads differently from the XML parser: processing
+ * instructions and comments are dropped, CDATA sections become plain text, and a doctype whose
+ * identifiers contain markup characters (`SYSTEM "x><img …>"`) is replaced by `<!DOCTYPE html>`.
+ */
+function scrubNonElementNodes(doc: Document, parent: Node): number {
+  let removed = 0
+  for (const node of Array.from(parent.childNodes)) {
+    switch (node.nodeType) {
+      case NODE_PROCESSING_INSTRUCTION:
+      case NODE_COMMENT:
+        node.parentNode?.removeChild(node)
+        removed++
+        break
+      case NODE_CDATA_SECTION:
+        node.parentNode?.replaceChild(doc.createTextNode(node.nodeValue || ''), node)
+        break
+      case NODE_DOCUMENT_TYPE: {
+        const doctype = node as DocumentType
+        if (/[<>"'`]/.test(`${doctype.name}${doctype.publicId}${doctype.systemId}`)) {
+          node.parentNode?.replaceChild(doc.implementation.createDocumentType('html', '', ''), node)
+          removed++
+        }
+        break
+      }
+      default:
+        if (node.hasChildNodes()) removed += scrubNonElementNodes(doc, node)
+    }
+  }
+  return removed
+}
+
+/** Removes active elements/attributes and neutralizes CSS; returns the number of removals. */
+function scrubDocument(doc: Document): number {
+  let removed = scrubNonElementNodes(doc, doc)
 
   const allElements = Array.from(doc.getElementsByTagNameNS('*', '*'))
   for (const el of allElements) {
+    if (!el.isConnected) continue
     const localName = (el.localName || el.tagName || '').toLowerCase()
     if (ACTIVE_ELEMENTS.has(localName)) {
       el.remove()
+      removed++
       continue
     }
     if (localName === 'meta' && /refresh/i.test(el.getAttribute('http-equiv') || '')) {
       el.remove()
+      removed++
       continue
     }
     if (localName === 'style' && el.textContent) {
@@ -188,9 +237,11 @@ export function sanitizeSectionDocument(doc: Document): void {
       const localAttr = (attr.localName || attr.name).toLowerCase()
       if (
         name.startsWith('on') ||
+        localAttr.startsWith('on') ||
         ((URL_ATTRIBUTES.has(name) || URL_ATTRIBUTES.has(localAttr)) && isDangerousUrl(attr.value))
       ) {
         el.removeAttributeNode(attr)
+        removed++
         continue
       }
       if (name === 'style') {
@@ -198,7 +249,21 @@ export function sanitizeSectionDocument(doc: Document): void {
       }
     }
   }
+  return removed
+}
 
+function isContentCspMeta(el: Element | null | undefined): boolean {
+  return (
+    !!el &&
+    (el.localName || '').toLowerCase() === 'meta' &&
+    el.getAttribute('http-equiv')?.toLowerCase() === 'content-security-policy' &&
+    el.getAttribute('content') === CONTENT_CSP
+  )
+}
+
+function ensureContentCsp(doc: Document): void {
+  const root = doc.documentElement
+  if (!root) return
   const ns = root.namespaceURI || XHTML_NS
   let head = doc.getElementsByTagNameNS('*', 'head')[0]
   if (!head) {
@@ -214,6 +279,54 @@ export function sanitizeSectionDocument(doc: Document): void {
   csp.setAttribute('http-equiv', 'Content-Security-Policy')
   csp.setAttribute('content', CONTENT_CSP)
   head.insertBefore(csp, head.firstChild)
+}
+
+/** First pass: sanitizes the parsed (XHTML) section document in place. */
+export function sanitizeSectionDocument(doc: Document): void {
+  if (!doc?.documentElement) return
+  scrubDocument(doc)
+  ensureContentCsp(doc)
+}
+
+function serializeHtmlDocument(doc: Document): string {
+  const doctype = doc.doctype ? '<!DOCTYPE html>' : ''
+  return doctype + doc.documentElement.outerHTML
+}
+
+/** Plain-text rendering used when a section still contains active content after sanitizing. */
+function plainTextSection(doc: Document): string {
+  const safe = new DOMParser().parseFromString(
+    '<!DOCTYPE html><html><head></head><body></body></html>',
+    'text/html'
+  )
+  ensureContentCsp(safe)
+  const text = doc.body?.textContent || doc.documentElement?.textContent || ''
+  for (const line of text.split(/\n\s*\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    const p = safe.createElement('p')
+    p.textContent = trimmed
+    safe.body.appendChild(p)
+  }
+  return serializeHtmlDocument(safe)
+}
+
+/**
+ * Second pass on the exact markup that goes into the iframe's `srcdoc`, which the iframe parses
+ * with the HTML parser: parse it the same way, sanitize again, re-serialize as HTML, then parse the
+ * result once more and verify that nothing active is left and the CSP `<meta>` is the first
+ * element in <head>. A section that fails verification is rendered as plain text.
+ */
+export function sanitizeSerializedSection(markup: string): string {
+  const parsed = new DOMParser().parseFromString(markup, 'text/html')
+  sanitizeSectionDocument(parsed)
+  const output = serializeHtmlDocument(parsed)
+
+  const check = new DOMParser().parseFromString(output, 'text/html')
+  if (scrubDocument(check) === 0 && isContentCspMeta(check.head?.firstElementChild)) {
+    return output
+  }
+  return plainTextSection(parsed)
 }
 
 const TAP_MAX_DURATION_MS = 500
@@ -354,6 +467,12 @@ export class EpubViewerEngine {
     // Must be registered before any section is rendered (see CONTENT_CSP).
     ;(book.spine as any).hooks.content.register(sanitizeSectionDocument)
     await book.ready
+    // Registered after `book.ready` so it runs after epub.js's own serialize hook (resource URL
+    // substitution). That hook writes its result to `section.output` without changing the hook
+    // argument, so the current markup must be read from `section.output`.
+    ;(book.spine as any).hooks.serialize.register((output: string, section: { output?: string }) => {
+      section.output = sanitizeSerializedSection(section.output ?? output)
+    })
 
     const metadata = await book.loaded.metadata
     const navigation = await book.loaded.navigation

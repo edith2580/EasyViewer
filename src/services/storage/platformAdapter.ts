@@ -154,17 +154,23 @@ export class PlatformStorageAdapter {
     await this.setItem(STORAGE_DIR_KEY, dir)
   }
 
-  /** Opens the storage folder in Explorer / Finder (creating and validating it first). */
+  /**
+   * Opens the storage folder in Explorer / Finder (creating and validating it first). Opening goes
+   * through the native `open_storage_dir` command, which only opens an approved directory; the
+   * webview itself has no permission to open arbitrary paths.
+   */
   async openStorageDir(): Promise<void> {
     const dir = await this.getStorageDir()
     await invokeCommand('allow_storage_dir', { path: dir })
-    const { openPath } = await import('@tauri-apps/plugin-opener')
-    await openPath(dir)
+    await invokeCommand('open_storage_dir', { path: dir })
   }
 
   /**
    * Lets the app read/write the given folders in this run. Folders outside the app data
-   * directory (a storage folder chosen earlier) must be allowed again after every start.
+   * directory (a storage folder chosen earlier) must be allowed again after every start; the
+   * native side only accepts folders the user picked in the folder dialog (remembered across
+   * runs). Afterwards the one-time migration window for folders remembered by older versions is
+   * closed with `seal_storage_dirs`.
    */
   async allowStorageDirs(dirs: string[]): Promise<void> {
     if (!(await isDesktopApp())) return
@@ -174,6 +180,11 @@ export class PlatformStorageAdapter {
       } catch (err) {
         console.warn('[PlatformAdapter] Storage folder unavailable:', dir, err)
       }
+    }
+    try {
+      await invokeCommand('seal_storage_dirs', {})
+    } catch (err) {
+      console.warn('[PlatformAdapter] Could not seal storage folders:', err)
     }
   }
 
