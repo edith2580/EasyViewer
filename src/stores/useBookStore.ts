@@ -1,11 +1,17 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import type { BookFormat, BookMeta, BookmarkItem, ReadingLocation, SyncPayload } from '@/types'
-import { isDesktopApp, platformPath, platformStorage } from '@/services/platform'
+import { isDesktopApp, platformCredential, platformPath, platformStorage } from '@/services/platform'
 import { extractEpubMetadata } from '@/engines/epub/epubEngine'
 import { createSampleEpubBook, createSampleTxtBook } from '@/services/sampleBooks'
 import { downloadRemoteBook, type DownloadProgress } from '@/services/network/downloadService'
-import { getOrCreateDeviceId, synchronizeReadingData } from '@/services/sync/syncService'
+import {
+  getOrCreateDeviceId,
+  sanitizeBookmarks,
+  sanitizeReadingPositions,
+  synchronizeReadingData,
+  SYNC_TOKEN_CREDENTIAL_ID
+} from '@/services/sync/syncService'
 import { useSettingsStore } from './useSettingsStore'
 
 const BOOKS_META_KEY = 'library_books_v1'
@@ -31,6 +37,15 @@ async function computeBookHash(name: string, buffer: ArrayBuffer): Promise<strin
     hash = Math.imul(hash, 16777619)
   }
   return `book-${(hash >>> 0).toString(16)}-${buffer.byteLength}`
+}
+
+async function sha256Hex(buffer: ArrayBuffer): Promise<string | undefined> {
+  try {
+    const digest = await crypto.subtle.digest('SHA-256', buffer)
+    return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('')
+  } catch {
+    return undefined
+  }
 }
 
 /** File name for a book imported before original names were kept (rebuilt from its metadata). */
@@ -145,9 +160,16 @@ export const useBookStore = defineStore('books', () => {
     const format: BookFormat =
       explicitFormat || (lower.endsWith('.epub') ? 'epub' : 'txt')
 
-    const id = await computeBookHash(filename, buffer)
+    let id = await computeBookHash(filename, buffer)
     const fileName = /\.(epub|txt)$/i.test(filename) ? filename : `${filename}.${format}`
-    const previous = books.value.find((b) => b.id === id)
+    const contentSha256 = await sha256Hex(buffer)
+    let previous = books.value.find((b) => b.id === id)
+    // The id only covers name, size and the first 4 KB, so a *different* book can share it. Then
+    // it gets its own id instead of overwriting the existing book's file and reading data.
+    if (previous && contentSha256 && !(await isSameBookContent(previous, contentSha256))) {
+      id = `${id}-${contentSha256.slice(0, 12)}`
+      previous = books.value.find((b) => b.id === id)
+    }
     const storedPath = await platformStorage.saveBookFile(
       id,
       fileName,
@@ -187,6 +209,7 @@ export const useBookStore = defineStore('books', () => {
       sourceUrl,
       fileName,
       storedPath,
+      ...(contentSha256 ? { contentSha256 } : {}),
       addedAt: existingIdx >= 0 ? books.value[existingIdx].addedAt : now,
       lastOpenedAt: now,
       lastLocation: positions.value[id]
@@ -200,6 +223,19 @@ export const useBookStore = defineStore('books', () => {
 
     await persistAll()
     return meta
+  }
+
+  /** Whether `book` (an existing library entry) holds exactly the content with `sha256`. */
+  async function isSameBookContent(book: BookMeta, sha256: string): Promise<boolean> {
+    if (book.contentSha256) return book.contentSha256 === sha256
+    // Entry imported before hashes were stored: compare with its file, if it is still there.
+    try {
+      const existing = await platformStorage.loadBookBinary(book.id, book.storedPath)
+      if (!existing) return true
+      return (await sha256Hex(existing)) === sha256
+    } catch {
+      return true
+    }
   }
 
   async function importFromUrl(
@@ -315,11 +351,13 @@ export const useBookStore = defineStore('books', () => {
     const settingsStore = useSettingsStore()
     isSyncing.value = true
     try {
+      const syncToken = await platformCredential.getPassword(SYNC_TOKEN_CREDENTIAL_ID)
       const result = await synchronizeReadingData(
         settingsStore.settings.syncEndpoint,
         positions.value,
         bookmarks.value,
-        settingsStore.settings
+        settingsStore.settings,
+        syncToken || undefined
       )
       positions.value = result.payload.positions
       bookmarks.value = result.payload.bookmarks
@@ -363,7 +401,7 @@ export const useBookStore = defineStore('books', () => {
       throw new Error('유효하지 않은 동기화 데이터 형식입니다.')
     }
     let updatedCount = 0
-    for (const [bookId, remoteLoc] of Object.entries(parsed.positions)) {
+    for (const [bookId, remoteLoc] of Object.entries(sanitizeReadingPositions(parsed.positions))) {
       const localLoc = positions.value[bookId]
       if (!localLoc || remoteLoc.updatedAt >= localLoc.updatedAt) {
         positions.value[bookId] = remoteLoc
@@ -371,7 +409,7 @@ export const useBookStore = defineStore('books', () => {
       }
     }
     if (parsed.bookmarks) {
-      for (const [bookId, remoteList] of Object.entries(parsed.bookmarks)) {
+      for (const [bookId, remoteList] of Object.entries(sanitizeBookmarks(parsed.bookmarks))) {
         const current = bookmarks.value[bookId] || []
         const map = new Map(current.map((b) => [b.locator, b]))
         for (const item of remoteList) {

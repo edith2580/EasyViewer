@@ -11,7 +11,11 @@ import {
   saveWebDavConnection
 } from '@/services/network/webdavService'
 import { getPlatformCapabilities, platformCredential } from '@/services/platform'
-import { grantHostConsent, RemoteFetchConsentError } from '@/services/network/remoteFetch'
+import {
+  describeTlsConsent,
+  grantHostConsent,
+  RemoteFetchConsentError
+} from '@/services/network/remoteFetch'
 import {
   ArrowLeft,
   Globe,
@@ -70,6 +74,8 @@ const pendingConsentPrompt = ref<{
   url: string
   origin: string
   source: 'url' | 'webdav'
+  fingerprint?: string
+  certChanged?: boolean
 } | null>(null)
 
 // 3. Full-Screen WebDAV Explorer State (shown as a new Full Screen upon connection success)
@@ -234,6 +240,8 @@ async function handleUrlDownload() {
         kind: err.code === 'PRIVATE_NETWORK_CONFIRM_REQUIRED' ? 'private' : 'tls',
         url: remoteUrl.value.trim(),
         origin: err.origin,
+        fingerprint: err.certFingerprint,
+        certChanged: err.certChanged,
         source: 'url'
       }
     }
@@ -336,6 +344,8 @@ async function handleConnectWebDav() {
         kind: err.code === 'PRIVATE_NETWORK_CONFIRM_REQUIRED' ? 'private' : 'tls',
         url,
         origin: err.origin,
+        fingerprint: err.certFingerprint,
+        certChanged: err.certChanged,
         source: 'webdav'
       }
     }
@@ -850,7 +860,7 @@ function formatItemDate(rawDate?: string): string {
                   {{
                     pendingConsentPrompt.kind === 'private'
                       ? `사설 네트워크(${pendingConsentPrompt.origin}) 연결을 신뢰하고 허용하시겠습니까?`
-                      : `자체 서명 TLS 인증서(${pendingConsentPrompt.origin}) 예외를 허용하시겠습니까?`
+                      : describeTlsConsent(pendingConsentPrompt)
                   }}
                 </span>
                 <div class="flex justify-end">
@@ -984,7 +994,7 @@ function formatItemDate(rawDate?: string): string {
                     {{
                       pendingConsentPrompt.kind === 'private'
                         ? `사설 네트워크 NAS(${pendingConsentPrompt.origin}) 연결을 신뢰하고 허용하시겠습니까?`
-                        : `자체 서명 TLS 인증서(${pendingConsentPrompt.origin}) 예외를 허용하시겠습니까?`
+                        : describeTlsConsent(pendingConsentPrompt)
                     }}
                   </span>
                   <div class="flex justify-end">

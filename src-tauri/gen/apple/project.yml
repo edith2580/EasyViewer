@@ -59,7 +59,6 @@ targets:
         CFBundleShortVersionString: 0.1.0
         CFBundleVersion: "0.1.0"
         NSAppTransportSecurity:
-          NSAllowsArbitraryLoads: true
           NSAllowsLocalNetworking: true
         NSLocalNetworkUsageDescription: "개발 서버(Vite)와 통신하기 위해 로컬 네트워크 권한이 필요합니다."
     entitlements:

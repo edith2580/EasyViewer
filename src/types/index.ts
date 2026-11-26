@@ -70,6 +70,8 @@ export interface BookMeta {
   fileName?: string
   /** Desktop/mobile app: absolute path of the stored file (in the storage folder at import time). */
   storedPath?: string
+  /** SHA-256 (hex) of the whole file; tells a re-import from a different book with a colliding id. */
+  contentSha256?: string
   addedAt: number
   lastOpenedAt: number
   lastLocation?: ReadingLocation
@@ -102,6 +104,8 @@ export interface TrustedRemoteHostConsent {
   hostKey: string
   allowPrivateNetwork: boolean
   allowSelfSignedTls: boolean
+  /** SHA-256 (hex) of the self-signed certificate the user approved; only it is accepted. */
+  pinnedCertSha256?: string
   consentedAt: number
 }
 

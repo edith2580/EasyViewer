@@ -14,7 +14,10 @@ const host = process.env.TAURI_DEV_HOST
 
 function easyViewerRemoteProxyPlugin(): Plugin {
   const sessionToken = crypto.randomBytes(24).toString('hex')
-  const handleProxy = createRemoteProxyHandler({ sessionToken })
+  // Host names the proxy accepts besides loopback/IP literals (DNS-rebinding guard; the proxy runs
+  // before Vite's own host check). Filled from the resolved server config.
+  let configuredHosts: string[] = []
+  const handleProxy = createRemoteProxyHandler({ sessionToken, allowedHosts: () => configuredHosts })
 
   return {
     name: 'easyviewer-remote-proxy',
@@ -23,6 +26,14 @@ function easyViewerRemoteProxyPlugin(): Plugin {
         '<head>',
         `<head>\n    <meta name="ev-proxy-token" content="${sessionToken}">`
       )
+    },
+    configResolved(config) {
+      const collect = (value: unknown) => (Array.isArray(value) ? value.filter((h) => typeof h === 'string') : [])
+      configuredHosts = [
+        ...(host ? [host] : []),
+        ...collect(config.server.allowedHosts),
+        ...collect(config.preview.allowedHosts)
+      ]
     },
     configureServer(server) {
       server.middlewares.use(handleProxy)

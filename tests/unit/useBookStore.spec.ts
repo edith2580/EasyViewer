@@ -34,6 +34,27 @@ describe('useBookStore characterization', () => {
     expect(store.books.find((b) => b.id === added.id)).toBeUndefined()
   })
 
+  it('keeps a different book with a colliding id separate instead of overwriting the first one', async () => {
+    const store = useBookStore()
+    // Same name, same size and identical first 4 KB => same short id; contents differ after that.
+    const head = 'ㄱ'.repeat(3000)
+    const first = new TextEncoder().encode(`${head}첫 번째 책의 끝`).buffer
+    const second = new TextEncoder().encode(`${head}두 번째 책의 끝`).buffer
+    expect(first.byteLength).toBe(second.byteLength)
+
+    const a = await store.addBookFromBuffer(first, '같은 이름.txt', 'txt')
+    const b = await store.addBookFromBuffer(second, '같은 이름.txt', 'txt')
+    expect(b.id).not.toBe(a.id)
+    expect(b.id.startsWith(a.id)).toBe(true)
+    expect(store.books.filter((book) => book.fileName === '같은 이름.txt')).toHaveLength(2)
+    expect(a.contentSha256).toMatch(/^[0-9a-f]{64}$/)
+
+    // Re-importing the identical file still maps onto the existing entry.
+    const again = await store.addBookFromBuffer(first, '같은 이름.txt', 'txt')
+    expect(again.id).toBe(a.id)
+    expect(store.books.filter((book) => book.fileName === '같은 이름.txt')).toHaveLength(2)
+  })
+
   it('initializes library from stored metadata without losing bookmarks or positions', async () => {
     await platformStorage.setItem('library_books_v1', [
       {

@@ -251,6 +251,44 @@ describe('/__remote_proxy Zero-Trust security middleware (US3 - TDD)', () => {
     expect(badFetchSite.status).toBe(403)
   })
 
+  it('rejects DNS-rebinding Host names even when Origin matches the Host (403 FORBIDDEN_HOST)', async () => {
+    const rebound = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = http.request(
+        {
+          host: '127.0.0.1',
+          port: proxyPort,
+          path: '/__remote_proxy',
+          method: 'GET',
+          headers: {
+            Host: `attacker.example:${proxyPort}`,
+            Origin: `http://attacker.example:${proxyPort}`,
+            'Sec-Fetch-Site': 'same-origin',
+            'x-target-url': 'https://example.com/book.txt'
+          }
+        },
+        (res) => {
+          let body = ''
+          res.on('data', (c) => (body += c))
+          res.on('end', () => resolve({ status: res.statusCode || 0, body }))
+        }
+      )
+      req.on('error', reject)
+      req.end()
+    })
+    expect(rebound.status).toBe(403)
+    expect(JSON.parse(rebound.body).code).toBe('FORBIDDEN_HOST')
+
+    const { isAllowedProxyHost } = await import('../../scripts/remoteProxyGuard.mjs')
+    expect(isAllowedProxyHost('localhost:1420')).toBe(true)
+    expect(isAllowedProxyHost('127.0.0.1:1420')).toBe(true)
+    expect(isAllowedProxyHost('[::1]:1420')).toBe(true)
+    expect(isAllowedProxyHost('192.168.0.20:1420')).toBe(true)
+    expect(isAllowedProxyHost('attacker.example:1420')).toBe(false)
+    expect(isAllowedProxyHost('dev.example.test:1420', ['dev.example.test'])).toBe(true)
+    expect(isAllowedProxyHost('a.dev.example.test', ['.dev.example.test'])).toBe(true)
+    expect(isAllowedProxyHost(undefined)).toBe(false)
+  })
+
   it('enforces method allowlist and request body size cap', async () => {
     const badMethod = await fetch(`http://127.0.0.1:${proxyPort}/__remote_proxy`, {
       method: 'DELETE',

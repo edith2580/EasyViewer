@@ -3,6 +3,8 @@ import { platformStorage } from '@/services/storage/platformAdapter'
 import { remoteFetch, RemoteFetchConsentError } from '@/services/network/remoteFetch'
 
 const SYNC_CACHE_KEY = 'cloud_sync_snapshot'
+/** Credential-store id of the optional sync server access token (never part of the payload). */
+export const SYNC_TOKEN_CREDENTIAL_ID = 'sync-endpoint-token'
 const DEVICE_ID_KEY = 'device_id'
 
 /** Non-transient 4xx HTTP rejection from the remote sync endpoint that must surface to the caller. */
@@ -34,6 +36,99 @@ function checkSyncResponseOk(res: Response): boolean {
   return false
 }
 
+const MAX_SYNC_BOOKS = 10_000
+const MAX_BOOKMARKS_PER_BOOK = 2_000
+const MAX_LOCATOR_LENGTH = 4_096
+const MAX_TEXT_LENGTH = 1_000
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+function isSafeKey(key: string): boolean {
+  return key.length > 0 && key.length <= 256 && !UNSAFE_KEYS.has(key)
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function boundedString(value: unknown, max: number): string | undefined {
+  return typeof value === 'string' ? value.slice(0, max) : undefined
+}
+
+function clampPercentage(value: unknown): number {
+  return Math.min(100, Math.max(0, finiteNumber(value) ?? 0))
+}
+
+/**
+ * Keeps only well-formed reading positions from data received from a sync server or a pasted
+ * snapshot: string locators of bounded length, finite timestamps, no prototype keys
+ * (`__proto__`, …), and a bounded number of books. Anything else is dropped.
+ */
+export function sanitizeReadingPositions(raw: unknown): Record<string, ReadingLocation> {
+  const out: Record<string, ReadingLocation> = {}
+  const record = asRecord(raw)
+  if (!record) return out
+  let count = 0
+  for (const [bookId, value] of Object.entries(record)) {
+    if (count >= MAX_SYNC_BOOKS) break
+    const loc = asRecord(value)
+    if (!isSafeKey(bookId) || !loc) continue
+    const updatedAt = finiteNumber(loc.updatedAt)
+    if (typeof loc.locator !== 'string' || loc.locator.length > MAX_LOCATOR_LENGTH || updatedAt === undefined) {
+      continue
+    }
+    const chapterTitle = boundedString(loc.chapterTitle, MAX_TEXT_LENGTH)
+    out[bookId] = {
+      bookId,
+      locator: loc.locator,
+      percentage: clampPercentage(loc.percentage),
+      ...(chapterTitle !== undefined ? { chapterTitle } : {}),
+      updatedAt,
+      deviceId: boundedString(loc.deviceId, 128) ?? 'unknown'
+    }
+    count++
+  }
+  return out
+}
+
+/** Same as {@link sanitizeReadingPositions} for bookmark lists. */
+export function sanitizeBookmarks(raw: unknown): Record<string, BookmarkItem[]> {
+  const out: Record<string, BookmarkItem[]> = {}
+  const record = asRecord(raw)
+  if (!record) return out
+  let count = 0
+  for (const [bookId, value] of Object.entries(record)) {
+    if (count >= MAX_SYNC_BOOKS) break
+    if (!isSafeKey(bookId) || !Array.isArray(value)) continue
+    const items: BookmarkItem[] = []
+    for (const entry of value.slice(0, MAX_BOOKMARKS_PER_BOOK)) {
+      const item = asRecord(entry)
+      if (!item) continue
+      const createdAt = finiteNumber(item.createdAt)
+      if (typeof item.locator !== 'string' || item.locator.length > MAX_LOCATOR_LENGTH || createdAt === undefined) {
+        continue
+      }
+      items.push({
+        id: boundedString(item.id, 128) || `bm-${createdAt}`,
+        bookId,
+        locator: item.locator,
+        percentage: clampPercentage(item.percentage),
+        title: boundedString(item.title, MAX_TEXT_LENGTH) || '책갈피',
+        excerpt: boundedString(item.excerpt, MAX_TEXT_LENGTH) ?? '',
+        createdAt
+      })
+    }
+    out[bookId] = items
+    count++
+  }
+  return out
+}
+
 export async function getOrCreateDeviceId(): Promise<string> {
   let id = await platformStorage.getItem<string>(DEVICE_ID_KEY, '')
   if (!id) {
@@ -57,6 +152,7 @@ export function mergeReadingPositions(
   let updatedCount = 0
 
   for (const [bookId, remoteLoc] of Object.entries(remote || {})) {
+    if (!isSafeKey(bookId)) continue
     const localLoc = merged[bookId]
     if (!localLoc || remoteLoc.updatedAt > localLoc.updatedAt) {
       merged[bookId] = remoteLoc
@@ -77,6 +173,7 @@ export function mergeBookmarks(
   const merged: Record<string, BookmarkItem[]> = { ...local }
 
   for (const [bookId, remoteList] of Object.entries(remote || {})) {
+    if (!isSafeKey(bookId)) continue
     const existing = merged[bookId] || []
     const byLocator = new Map<string, BookmarkItem>()
     for (const item of existing) {
@@ -101,7 +198,9 @@ export async function synchronizeReadingData(
   endpoint: string,
   localPositions: Record<string, ReadingLocation>,
   localBookmarks: Record<string, BookmarkItem[]>,
-  settings: ViewerSettings
+  settings: ViewerSettings,
+  /** Optional access token for the sync server, sent as `Authorization: Bearer …`. */
+  authToken?: string
 ): Promise<{
   payload: SyncPayload
   updatedCount: number
@@ -112,11 +211,15 @@ export async function synchronizeReadingData(
   let mode: 'remote' | 'local-hub' = 'local-hub'
 
   const cleanEndpoint = endpoint.trim()
+  const token = authToken?.trim()
+  const authHeaders: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {}
   if (cleanEndpoint && (cleanEndpoint.startsWith('http://') || cleanEndpoint.startsWith('https://'))) {
     try {
       const getRes = await remoteFetch(cleanEndpoint, {
         method: 'GET',
-        headers: { Accept: 'application/json' }
+        headers: { Accept: 'application/json', ...authHeaders },
+        // Reading positions and bookmark excerpts never go over plain HTTP to the internet.
+        forbidPlaintextPublic: true
       })
       if (checkSyncResponseOk(getRes)) {
         remotePayload = (await getRes.json()) as SyncPayload
@@ -133,9 +236,9 @@ export async function synchronizeReadingData(
 
   const { merged: mergedPositions, updatedCount } = mergeReadingPositions(
     localPositions,
-    remotePayload?.positions || {}
+    sanitizeReadingPositions(remotePayload?.positions)
   )
-  const mergedBookmarks = mergeBookmarks(localBookmarks, remotePayload?.bookmarks || {})
+  const mergedBookmarks = mergeBookmarks(localBookmarks, sanitizeBookmarks(remotePayload?.bookmarks))
 
   const nextPayload: SyncPayload = {
     version: 1,
@@ -152,8 +255,9 @@ export async function synchronizeReadingData(
     try {
       const postRes = await remoteFetch(cleanEndpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(nextPayload)
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        body: JSON.stringify(nextPayload),
+        forbidPlaintextPublic: true
       })
       if (checkSyncResponseOk(postRes)) {
         mode = 'remote'

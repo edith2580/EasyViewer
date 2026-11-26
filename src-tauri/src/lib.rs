@@ -75,6 +75,10 @@ pub struct SafeRemoteFetchRequest {
     pub body_base64: Option<String>,
     pub allow_private_nas: Option<bool>,
     pub allow_self_signed_tls: Option<bool>,
+    /// SHA-256 of the self-signed certificate the user approved for this origin (TOFU pin).
+    pub pinned_cert_sha256: Option<String>,
+    /// Refuse plain `http://` to public-internet addresses (sync payloads).
+    pub forbid_plaintext_public: Option<bool>,
     pub timeout_ms: Option<u64>,
     pub max_response_bytes: Option<u64>,
 }
@@ -85,7 +89,6 @@ pub struct SafeRemoteFetchResponse {
     pub status: u16,
     pub status_text: String,
     pub headers: HashMap<String, String>,
-    pub body_base64: String,
     pub final_url: String,
 }
 
@@ -995,10 +998,22 @@ async fn install_release_update(
         }
     }
 
-    let update_dir = std::env::temp_dir().join("easyviewer-updates");
+    // Per-user app cache folder, not the shared temp dir: on Linux `/tmp/easyviewer-updates` is a
+    // predictable world-writable location where another local user could pre-create the folder
+    // or plant a symlink and swap the installer between the hash check and its launch.
+    let update_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("UPDATE_IO_FAILED: 앱 캐시 폴더를 확인할 수 없습니다: {e}"))?
+        .join("updates");
     std::fs::create_dir_all(&update_dir)
         .map_err(|e| format!("UPDATE_IO_FAILED: 임시 업데이트 폴더 생성 실패: {e}"))?;
     let dest_path = update_dir.join(&safe_name);
+    // Never write through a pre-existing file or symlink at the destination.
+    if std::fs::symlink_metadata(&dest_path).is_ok() {
+        std::fs::remove_file(&dest_path)
+            .map_err(|e| format!("UPDATE_IO_FAILED: 이전 업데이트 파일 삭제 실패: {e}"))?;
+    }
 
     let mut acc = Vec::new();
     while let Some(chunk) = response
@@ -1399,15 +1414,223 @@ fn read_validated_book_file(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// Normalizes a certificate pin (`sha256:AB:CD…`, `abcd…`) to 64 lowercase hex characters.
+pub fn normalize_cert_pin(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let body = trimmed.strip_prefix("sha256:").unwrap_or(trimmed);
+    let hex: String = body
+        .chars()
+        .filter(|c| *c != ':' && !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(hex)
+}
+
+/// Host form used to match a TLS `ServerName` against the pinned host.
+fn tls_pin_host(url: &Url) -> Option<String> {
+    match url.host()? {
+        url::Host::Domain(d) => Some(d.trim_end_matches('.').to_ascii_lowercase()),
+        url::Host::Ipv4(v4) => Some(v4.to_string()),
+        url::Host::Ipv6(v6) => Some(v6.to_string()),
+    }
+}
+
+fn tls_server_name_host(name: &rustls::pki_types::ServerName<'_>) -> String {
+    use rustls::pki_types::ServerName;
+    match name {
+        ServerName::DnsName(d) => d.as_ref().trim_end_matches('.').to_ascii_lowercase(),
+        ServerName::IpAddress(ip) => IpAddr::from(*ip).to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Accepts the pinned host's certificate only when its SHA-256 equals the pin the user approved
+/// (trust on first use), or when it is a publicly valid certificate anyway. Every other host
+/// (redirect targets) gets normal WebPKI verification. Replaces `danger_accept_invalid_certs`,
+/// which accepted *any* certificate for the whole request.
+#[derive(Debug)]
+struct PinnedCertVerifier {
+    pinned_host: String,
+    pinned_sha256: String,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    webpki: Arc<rustls::client::WebPkiServerVerifier>,
+    /// Fingerprint the pinned host actually presented (for the re-confirmation prompt).
+    observed: Arc<Mutex<Option<String>>>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if tls_server_name_host(server_name) == self.pinned_host {
+            let fingerprint = sha256_hex(end_entity.as_ref());
+            if let Ok(mut guard) = self.observed.lock() {
+                *guard = Some(fingerprint.clone());
+            }
+            if !self.pinned_sha256.is_empty() && fingerprint == self.pinned_sha256 {
+                return Ok(rustls::client::danger::ServerCertVerified::assertion());
+            }
+        }
+        self.webpki
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn webpki_root_store() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
+}
+
+/// rustls config whose verifier pins `pinned_host` to `pinned_sha256` (empty = no pin, used to
+/// read the presented certificate's fingerprint without trusting it).
+fn build_pinned_verifier(
+    pinned_host: String,
+    pinned_sha256: String,
+    observed: Arc<Mutex<Option<String>>>,
+) -> Result<Arc<PinnedCertVerifier>, String> {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let webpki = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(webpki_root_store()),
+        provider.clone(),
+    )
+    .build()
+    .map_err(|e| format!("HTTP_CLIENT_ERROR: {e}"))?;
+    Ok(Arc::new(PinnedCertVerifier {
+        pinned_host,
+        pinned_sha256,
+        provider,
+        webpki,
+        observed,
+    }))
+}
+
+fn build_pinned_tls_config(
+    pinned_host: String,
+    pinned_sha256: String,
+    observed: Arc<Mutex<Option<String>>>,
+) -> Result<rustls::ClientConfig, String> {
+    let verifier = build_pinned_verifier(pinned_host, pinned_sha256, observed)?;
+    let provider = Arc::clone(&verifier.provider);
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("HTTP_CLIENT_ERROR: {e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+/// Reads the SHA-256 of the certificate `url`'s server presents. The probe verifier never trusts
+/// a non-public certificate, so the handshake is aborted before any HTTP data is sent.
+async fn probe_server_cert_sha256(
+    url: &Url,
+    pinned_map: Arc<Mutex<HashMap<String, IpAddr>>>,
+) -> Option<String> {
+    let host = tls_pin_host(url)?;
+    let observed = Arc::new(Mutex::new(None));
+    let config = build_pinned_tls_config(host, String::new(), Arc::clone(&observed)).ok()?;
+    let client = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .dns_resolver(Arc::new(PinnedSsrfResolver { pinned: pinned_map }))
+        .tls_backend_preconfigured(config)
+        .build()
+        .ok()?;
+    let _ = client.head(url.clone()).send().await;
+    let fingerprint = observed.lock().ok()?.clone();
+    fingerprint
+}
+
+fn error_chain_text(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(inner) = source {
+        let part = inner.to_string();
+        if !text.contains(&part) {
+            text.push_str(": ");
+            text.push_str(&part);
+        }
+        source = inner.source();
+    }
+    text
+}
+
+fn looks_like_tls_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    ["certificate", "tls", "self-signed", "self signed", "unknown issuer", "invalidcert"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// Encodes a fetch result as `[u32 BE metadata length][metadata JSON][raw body]` so large book
+/// downloads cross the IPC bridge as binary instead of a base64 string inside JSON (which needed
+/// several 256 MiB+ copies).
+pub fn encode_fetch_response(meta: &SafeRemoteFetchResponse, body: &[u8]) -> Result<Vec<u8>, String> {
+    let meta_json = serde_json::to_vec(meta).map_err(|e| format!("ENCODE_FAILED: {e}"))?;
+    let meta_len = u32::try_from(meta_json.len()).map_err(|_| "ENCODE_FAILED".to_string())?;
+    let mut out = Vec::with_capacity(4 + meta_json.len() + body.len());
+    out.extend_from_slice(&meta_len.to_be_bytes());
+    out.extend_from_slice(&meta_json);
+    out.extend_from_slice(body);
+    Ok(out)
+}
+
 /// Single Zero-Trust Rust network gate for WebDAV sync & remote downloads.
 #[tauri::command]
-async fn safe_remote_fetch(
-    request: SafeRemoteFetchRequest,
-) -> Result<SafeRemoteFetchResponse, String> {
+async fn safe_remote_fetch(request: SafeRemoteFetchRequest) -> Result<tauri::ipc::Response, String> {
     let mut method = is_allowed_method(&request.method)?;
     let mut current_url = validate_url_syntax(&request.url)?;
     let allow_private_nas = request.allow_private_nas.unwrap_or(false);
     let allow_self_signed = request.allow_self_signed_tls.unwrap_or(false);
+    let forbid_plaintext_public = request.forbid_plaintext_public.unwrap_or(false);
+    // A self-signed certificate is only ever accepted against the fingerprint the user approved.
+    let cert_pin = if allow_self_signed {
+        request.pinned_cert_sha256.as_deref().and_then(normalize_cert_pin)
+    } else {
+        None
+    };
     let timeout = Duration::from_millis(request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1_000, 120_000));
     let max_bytes = request
         .max_response_bytes
@@ -1441,38 +1664,40 @@ async fn safe_remote_fetch(
     }
 
     let initial_url = current_url.clone();
+    let initial_host = tls_pin_host(&initial_url).unwrap_or_default();
     let deadline = Instant::now() + timeout;
     let pinned_map = Arc::new(Mutex::new(HashMap::<String, IpAddr>::new()));
     let resolver = Arc::new(PinnedSsrfResolver {
         pinned: Arc::clone(&pinned_map),
     });
+    let observed_cert = Arc::new(Mutex::new(None::<String>));
     let client_builder = reqwest::Client::builder()
         .redirect(Policy::none())
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .dns_resolver(resolver);
 
-    // On Android, reqwest's default `rustls-platform-verifier` panics unless a custom
-    // Kotlin/JNI verifier component is wired up. Use `webpki-roots` directly when
-    // verifying standard HTTPS certificates, and `danger_accept_invalid_certs(true)`
-    // when the user explicitly confirms a self-signed NAS certificate.
-    #[cfg(target_os = "android")]
-    let client_builder = if !allow_self_signed {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let mut tls_config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|e| format!("HTTP_CLIENT_ERROR: {e}"))?
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        client_builder.tls_backend_preconfigured(tls_config)
+    let client_builder = if let Some(pin) = cert_pin.clone() {
+        client_builder.tls_backend_preconfigured(build_pinned_tls_config(
+            initial_host.clone(),
+            pin,
+            Arc::clone(&observed_cert),
+        )?)
     } else {
-        client_builder.danger_accept_invalid_certs(true)
+        // On Android, reqwest's default `rustls-platform-verifier` panics unless a custom
+        // Kotlin/JNI verifier component is wired up, so standard HTTPS uses `webpki-roots`.
+        #[cfg(target_os = "android")]
+        let client_builder = {
+            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            let mut tls_config = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| format!("HTTP_CLIENT_ERROR: {e}"))?
+                .with_root_certificates(webpki_root_store())
+                .with_no_client_auth();
+            tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            client_builder.tls_backend_preconfigured(tls_config)
+        };
+        client_builder
     };
-
-    #[cfg(not(target_os = "android"))]
-    let client_builder = client_builder.danger_accept_invalid_certs(allow_self_signed);
 
     let client = client_builder
         .build()
@@ -1485,6 +1710,17 @@ async fn safe_remote_fetch(
             guard.insert(host, pinned_addr.ip());
         }
 
+        // Credentials (and sync data) must not cross the public internet unencrypted.
+        if current_url.scheme() == "http"
+            && classify_ip(pinned_addr.ip()) == IpClassification::Public
+            && (forbid_plaintext_public || header_map.contains_key(AUTHORIZATION))
+        {
+            return Err(
+                "INSECURE_HTTP_BLOCKED: 암호화되지 않은 HTTP로 인터넷의 서버에 비밀번호나 동기화 데이터를 보낼 수 없습니다. HTTPS 주소를 사용해 주세요."
+                    .into(),
+            );
+        }
+
         let mut req_builder = client
             .request(method.clone(), current_url.clone())
             .timeout(remaining);
@@ -1493,22 +1729,38 @@ async fn safe_remote_fetch(
             req_builder = req_builder.body(body_bytes.clone());
         }
 
-        let mut response = req_builder.send().await.map_err(|e| {
-            let msg = e.to_string();
-            let lower = msg.to_ascii_lowercase();
-            if e.is_timeout() || Instant::now() >= deadline {
-                format!("TIMEOUT: 원격 요청 제한 시간이 초과되었습니다: {msg}")
-            } else if !allow_self_signed
-                && (lower.contains("certificate")
-                    || lower.contains("tls")
-                    || lower.contains("self-signed")
-                    || lower.contains("unknown issuer"))
-            {
-                format!("SELF_SIGNED_TLS_CONFIRM_REQUIRED: TLS 인증서 검증에 실패했습니다: {msg}")
-            } else {
-                format!("REMOTE_FETCH_FAILED: 원격 요청 실패: {msg}")
+        let mut response = match req_builder.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let msg = error_chain_text(&e);
+                if e.is_timeout() || Instant::now() >= deadline {
+                    return Err(format!("TIMEOUT: 원격 요청 제한 시간이 초과되었습니다: {msg}"));
+                }
+                let on_initial_host =
+                    tls_pin_host(&current_url).as_deref() == Some(initial_host.as_str());
+                if current_url.scheme() == "https" && on_initial_host && looks_like_tls_error(&msg) {
+                    let observed = observed_cert.lock().ok().and_then(|g| g.clone());
+                    let presented = match observed {
+                        Some(fp) => Some(fp),
+                        None => probe_server_cert_sha256(&current_url, Arc::clone(&pinned_map)).await,
+                    };
+                    let changed = cert_pin.is_some();
+                    let lead = if changed {
+                        "이전에 신뢰한 인증서와 다른 인증서가 제시되었습니다. 중간자 공격일 수 있으니 서버 인증서를 직접 확인해 주세요"
+                    } else {
+                        "TLS 인증서 검증에 실패했습니다"
+                    };
+                    return Err(format!(
+                        "SELF_SIGNED_TLS_CONFIRM_REQUIRED: {lead}{}{}",
+                        presented
+                            .map(|fp| format!(" [cert-sha256:{fp}]"))
+                            .unwrap_or_default(),
+                        if changed { " [cert-changed]" } else { "" }
+                    ));
+                }
+                return Err(format!("REMOTE_FETCH_FAILED: 원격 요청 실패: {msg}"));
             }
-        })?;
+        };
 
         let status = response.status();
         if status.is_redirection() {
@@ -1567,13 +1819,13 @@ async fn safe_remote_fetch(
             acc.extend_from_slice(&chunk);
         }
 
-        return Ok(SafeRemoteFetchResponse {
+        let meta = SafeRemoteFetchResponse {
             status: status.as_u16(),
             status_text: status.canonical_reason().unwrap_or("").to_string(),
             headers: response_headers,
-            body_base64: base64::engine::general_purpose::STANDARD.encode(&acc),
             final_url: current_url.to_string(),
-        });
+        };
+        return Ok(tauri::ipc::Response::new(encode_fetch_response(&meta, &acc)?));
     }
 
     Err("TOO_MANY_REDIRECTS: 리다이렉트 처리에 실패했습니다.".into())
@@ -1985,6 +2237,72 @@ mod tests {
         let expired_past =
             compute_remaining_budget(deadline, deadline + Duration::from_millis(5)).unwrap_err();
         assert!(expired_past.contains("TIMEOUT:"));
+    }
+
+    #[test]
+    fn pinned_cert_verifier_accepts_only_the_approved_certificate_for_the_pinned_host() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        let cert = CertificateDer::from(b"self-signed nas certificate".to_vec());
+        let other = CertificateDer::from(b"attacker certificate".to_vec());
+        let observed = Arc::new(Mutex::new(None));
+        let verifier = build_pinned_verifier(
+            "nas.example.lan".into(),
+            sha256_hex(cert.as_ref()),
+            Arc::clone(&observed),
+        )
+        .unwrap();
+        // The full client config must build too.
+        assert!(build_pinned_tls_config("nas.example.lan".into(), "00".repeat(32), Arc::new(Mutex::new(None))).is_ok());
+        let pinned_name = ServerName::try_from("nas.example.lan").unwrap();
+        let other_name = ServerName::try_from("other.example.com").unwrap();
+        let now = UnixTime::now();
+
+        assert!(verifier.verify_server_cert(&cert, &[], &pinned_name, &[], now).is_ok());
+        // A different certificate for the pinned host, or the pinned certificate on another host
+        // (redirect target), must go through normal verification and fail.
+        assert!(verifier.verify_server_cert(&other, &[], &pinned_name, &[], now).is_err());
+        assert_eq!(observed.lock().unwrap().clone(), Some(sha256_hex(other.as_ref())));
+        assert!(verifier.verify_server_cert(&cert, &[], &other_name, &[], now).is_err());
+
+        // Empty pin (fingerprint probe) never trusts a non-public certificate.
+        let probe = build_pinned_verifier("nas.example.lan".into(), String::new(), Arc::new(Mutex::new(None)))
+            .unwrap();
+        assert!(probe.verify_server_cert(&cert, &[], &pinned_name, &[], now).is_err());
+    }
+
+    #[test]
+    fn cert_pins_normalize_and_binary_fetch_response_round_trips() {
+        let hex = "ab".repeat(32);
+        assert_eq!(normalize_cert_pin(&hex), Some(hex.clone()));
+        assert_eq!(normalize_cert_pin(&format!("sha256:{}", hex.to_uppercase())), Some(hex.clone()));
+        let colon = hex
+            .as_bytes()
+            .chunks(2)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join(":");
+        assert_eq!(normalize_cert_pin(&colon), Some(hex.clone()));
+        assert_eq!(normalize_cert_pin("abcd"), None);
+        assert_eq!(normalize_cert_pin(&"zz".repeat(32)), None);
+
+        let meta = SafeRemoteFetchResponse {
+            status: 200,
+            status_text: "OK".into(),
+            headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+            final_url: "https://example.com/a.txt".into(),
+        };
+        let body = [0u8, 1, 2, 255];
+        let encoded = encode_fetch_response(&meta, &body).unwrap();
+        let meta_len = u32::from_be_bytes(encoded[..4].try_into().unwrap()) as usize;
+        let decoded: serde_json::Value = serde_json::from_slice(&encoded[4..4 + meta_len]).unwrap();
+        assert_eq!(decoded["status"], 200);
+        assert_eq!(decoded["finalUrl"], "https://example.com/a.txt");
+        assert_eq!(&encoded[4 + meta_len..], &body);
+
+        assert!(looks_like_tls_error("invalid peer certificate: UnknownIssuer"));
+        assert!(!looks_like_tls_error("connection refused"));
     }
 
     #[test]

@@ -258,6 +258,32 @@ function sendJsonError(res, statusCode, message, code) {
   res.end(JSON.stringify({ error: message, code }))
 }
 
+/**
+ * DNS-rebinding guard. This middleware is installed from `configureServer`, so it runs *before*
+ * Vite's own host check. A rebinding page (attacker.example resolving to 127.0.0.1) sends
+ * `Host: attacker.example` together with a matching Origin, which passes the same-origin check
+ * below — so the Host itself must be a loopback name, an IP literal (cannot be rebound), or a host
+ * configured explicitly (TAURI_DEV_HOST / server.allowedHosts).
+ */
+export function isAllowedProxyHost(hostHeader, extraAllowedHosts = []) {
+  if (typeof hostHeader !== 'string' || !hostHeader) return false
+  let hostname
+  try {
+    hostname = new URL(`http://${hostHeader}`).hostname.toLowerCase()
+  } catch {
+    return false
+  }
+  hostname = hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '')
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) return true
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname) || hostname.includes(':')) return true
+  return extraAllowedHosts
+    .filter((h) => typeof h === 'string' && h)
+    .map((h) => h.toLowerCase().replace(/\.$/, ''))
+    .some((allowed) =>
+      allowed.startsWith('.') ? hostname === allowed.slice(1) || hostname.endsWith(allowed) : hostname === allowed
+    )
+}
+
 function validateSameOrigin(req) {
   const hostHeader = req.headers.host
   if (!hostHeader) return false
@@ -325,7 +351,8 @@ export function createRemoteProxyHandler({
   maxRequestBodyBytes = DEFAULT_MAX_REQUEST_BODY_BYTES,
   maxResponseBodyBytes = DEFAULT_MAX_RESPONSE_BODY_BYTES,
   timeoutMs = DEFAULT_TIMEOUT_MS,
-  testDnsOverride
+  testDnsOverride,
+  allowedHosts = []
 } = {}) {
   return async (req, res, next) => {
     if (!req.url || !req.url.startsWith('/__remote_proxy')) {
@@ -334,6 +361,12 @@ export function createRemoteProxyHandler({
     }
 
     res.setHeader(PROXY_MARKER_HEADER, '1')
+
+    const extraHosts = typeof allowedHosts === 'function' ? allowedHosts() : allowedHosts
+    if (!isAllowedProxyHost(req.headers.host, Array.isArray(extraHosts) ? extraHosts : [])) {
+      sendJsonError(res, 403, '허용되지 않은 Host 헤더입니다.', 'FORBIDDEN_HOST')
+      return
+    }
 
     if (!validateSameOrigin(req)) {
       sendJsonError(res, 403, '허용되지 않은 교차 출처 요청입니다.', 'FORBIDDEN_ORIGIN')

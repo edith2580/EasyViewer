@@ -5,6 +5,8 @@ import {
   getOrCreateDeviceId,
   mergeBookmarks,
   mergeReadingPositions,
+  sanitizeBookmarks,
+  sanitizeReadingPositions,
   synchronizeReadingData
 } from '@/services/sync/syncService'
 
@@ -200,5 +202,57 @@ describe('syncService characterization', () => {
     await expect(
       synchronizeReadingData('https://sync.example.com/payload', {}, {}, settings)
     ).rejects.toThrow(/401/)
+  })
+
+  it('drops malformed or prototype-polluting entries received from a sync server', () => {
+    const hostile = JSON.parse(
+      '{"__proto__":{"locator":"x","updatedAt":1},"constructor":{"locator":"x","updatedAt":1},' +
+        '"book-ok":{"locator":"epubcfi(/6/2)","percentage":250,"updatedAt":5,"deviceId":"d","chapterTitle":"1장"},' +
+        '"book-bad-locator":{"locator":{"$gt":""},"updatedAt":5},' +
+        '"book-bad-time":{"locator":"x","updatedAt":"soon"},' +
+        `"book-long":{"locator":"${'a'.repeat(5000)}","updatedAt":1}}`
+    )
+    const positions = sanitizeReadingPositions(hostile)
+    expect(Object.keys(positions)).toEqual(['book-ok'])
+    expect(positions['book-ok'].percentage).toBe(100)
+    expect(({} as Record<string, unknown>).locator).toBeUndefined()
+    expect(sanitizeReadingPositions(null)).toEqual({})
+    expect(sanitizeReadingPositions([1, 2])).toEqual({})
+
+    const bookmarks = sanitizeBookmarks(
+      JSON.parse(
+        '{"__proto__":[{"locator":"x","createdAt":1}],"book-ok":[{"id":"b1","locator":"l1","percentage":10,"title":"t","excerpt":"e","createdAt":3},{"locator":5,"createdAt":1},"junk"],"book-not-list":{"locator":"x"}}'
+      )
+    )
+    expect(Object.keys(bookmarks)).toEqual(['book-ok'])
+    expect(bookmarks['book-ok']).toHaveLength(1)
+    expect(bookmarks['book-ok'][0]).toMatchObject({ id: 'b1', bookId: 'book-ok', locator: 'l1' })
+  })
+
+  it('sends the optional access token and asks the native side to refuse plaintext public HTTP', async () => {
+    const remote = await import('@/services/network/remoteFetch')
+    const calls: Array<{ url: string; options: Record<string, unknown> }> = []
+    vi.spyOn(remote, 'remoteFetch').mockImplementation(async (url, options) => {
+      calls.push({ url, options: (options ?? {}) as Record<string, unknown> })
+      return new Response(JSON.stringify({ version: 1, positions: {}, bookmarks: {} }), { status: 200 })
+    })
+    const settings = {
+      viewMode: 'paged',
+      theme: 'light',
+      fontFamily: 'sans',
+      fontSize: 18,
+      lineHeight: 1.7,
+      pageMargin: 24,
+      autoSync: false,
+      syncEndpoint: 'https://sync.example.com/payload'
+    } as unknown as ViewerSettings
+    await synchronizeReadingData('https://sync.example.com/payload', {}, {}, settings, 'secret-token')
+    expect(calls).toHaveLength(2)
+    for (const call of calls) {
+      expect((call.options.headers as Record<string, string>).Authorization).toBe('Bearer secret-token')
+      expect(call.options.forbidPlaintextPublic).toBe(true)
+    }
+    const posted = JSON.parse(String(calls[1].options.body))
+    expect(JSON.stringify(posted)).not.toContain('secret-token')
   })
 })

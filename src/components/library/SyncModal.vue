@@ -1,11 +1,17 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { useBookStore } from '@/stores/useBookStore'
 import { useSettingsStore } from '@/stores/useSettingsStore'
-import { grantHostConsent, RemoteFetchConsentError } from '@/services/network/remoteFetch'
+import { isTauriEnv, platformCredential } from '@/services/platform'
+import { SYNC_TOKEN_CREDENTIAL_ID } from '@/services/sync/syncService'
+import {
+  describeTlsConsent,
+  grantHostConsent,
+  RemoteFetchConsentError
+} from '@/services/network/remoteFetch'
 import { RefreshCw, Cloud, Copy, Upload, Check, X } from 'lucide-vue-next'
 
-defineProps<{
+const props = defineProps<{
   open: boolean
 }>()
 
@@ -20,10 +26,46 @@ const syncSnapshotJson = ref('')
 const feedbackMsg = ref('')
 const errorMsg = ref('')
 const copied = ref(false)
+/** Optional sync server access token (Bearer). Kept in the OS credential store, never in settings. */
+const syncToken = ref('')
+
+watch(
+  () => props.open,
+  async (isOpen) => {
+    if (!isOpen) return
+    try {
+      syncToken.value = await platformCredential.getPassword(SYNC_TOKEN_CREDENTIAL_ID)
+    } catch {
+      syncToken.value = ''
+    }
+  },
+  { immediate: true }
+)
+
+/**
+ * Saved on input change (blur), which happens before the sync button's click; the credential
+ * service updates its in-memory copy synchronously, so the next sync already uses the new value.
+ */
+async function saveSyncToken() {
+  const token = syncToken.value.trim()
+  try {
+    if (!token) {
+      await platformCredential.removePassword(SYNC_TOKEN_CREDENTIAL_ID)
+      return
+    }
+    // App: OS keychain. Web: this session only (no browser-storage persistence of secrets).
+    await platformCredential.setPassword(SYNC_TOKEN_CREDENTIAL_ID, token, { remember: isTauriEnv() })
+  } catch (err) {
+    errorMsg.value = `액세스 토큰을 저장하지 못했습니다: ${err instanceof Error ? err.message : String(err)}`
+  }
+}
+
 const pendingConsentPrompt = ref<{
   kind: 'private' | 'tls'
   url: string
   origin: string
+  fingerprint?: string
+  certChanged?: boolean
 } | null>(null)
 
 async function approveSyncConsent() {
@@ -53,7 +95,9 @@ async function handleRunSync() {
       pendingConsentPrompt.value = {
         kind: err.code === 'PRIVATE_NETWORK_CONFIRM_REQUIRED' ? 'private' : 'tls',
         url: settingsStore.settings.syncEndpoint.trim(),
-        origin: err.origin
+        origin: err.origin,
+        fingerprint: err.certFingerprint,
+        certChanged: err.certChanged
       }
     }
     errorMsg.value = err instanceof Error ? err.message : '동기화 중 오류가 발생했습니다.'
@@ -140,6 +184,25 @@ async function handleImportJson() {
           </div>
         </div>
 
+        <div>
+          <label class="block text-xs font-semibold mb-1 opacity-80" for="sync-token-input">
+            동기화 서버 액세스 토큰 (선택 사항)
+          </label>
+          <input
+            id="sync-token-input"
+            v-model="syncToken"
+            type="password"
+            autocomplete="off"
+            placeholder="서버가 요구하면 입력 (Authorization: Bearer 헤더로 전송)"
+            class="w-full px-3 py-2 rounded-xl border text-xs bg-transparent focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            :style="{ borderColor: 'var(--ev-border)' }"
+            @change="saveSyncToken"
+          />
+          <p class="mt-1 text-[11px] opacity-60">
+            토큰은 앱에서는 OS 자격 증명 저장소에, 웹에서는 현재 세션에만 보관되며 동기화 데이터에는 포함되지 않습니다. 인터넷의 서버에는 HTTPS 주소로만 동기화합니다.
+          </p>
+        </div>
+
         <!-- Cross-device JSON Snapshot Export / Import -->
         <div class="pt-2 border-t" :style="{ borderColor: 'var(--ev-border)' }">
           <div class="flex items-center justify-between mb-1.5">
@@ -191,7 +254,7 @@ async function handleImportJson() {
             {{
               pendingConsentPrompt.kind === 'private'
                 ? `사설 네트워크(${pendingConsentPrompt.origin}) 동기화 서버 연결을 신뢰하고 허용하시겠습니까?`
-                : `자체 서명 TLS 인증서(${pendingConsentPrompt.origin}) 예외를 허용하시겠습니까?`
+                : describeTlsConsent(pendingConsentPrompt)
             }}
           </span>
           <div class="flex justify-end">
