@@ -69,7 +69,7 @@ const OS_LABELS: Record<RuntimeOs, string> = {
 export function getBundledAppVersion(): string {
   return typeof __APP_VERSION__ === 'string' && __APP_VERSION__.trim()
     ? __APP_VERSION__.trim()
-    : '0.2.4'
+    : '0.2.5'
 }
 
 export function compareSemver(a: string, b: string): number {
