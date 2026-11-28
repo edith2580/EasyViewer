@@ -1,4 +1,4 @@
-import type { SearchResultItem, TocItem } from "@/types";
+import type { SearchResultItem, TocItem, TxtTocPatternRule } from "@/types";
 
 export interface TxtParagraph {
   index: number;
@@ -88,13 +88,112 @@ export function detectAndDecodeText(buffer: ArrayBuffer): {
 //const HEADING_REGEX = /^(제\s*\d+\s*[장화편절부]|Chapter\s+\d+|CHAPTER\s+\d+|\[.+?\]|\d+\.\s+.+|#{1,3}\s+.+)/
 // `#001`, `#001화`, `#001 제목`: the number (and optional 화) must be followed by the end of the
 // line, whitespace or punctuation, so hashtag-like lines such as `#2024년` are not headings.
+// Also supports angle-bracketed chapter headings like `〈 76. 제목 〉`, `〈 76화 제목 〉`, `< 76. 제목 >`, `< 76화 제목 >`.
 const HEADING_REGEX =
-  /^(제\s*\d+\s*[장화편]|\d+\s*화|#\d+(?:\s*화)?(?=$|[\s.,:)\]-])|CHAPTER\s+\d+|\d+\.\s+.+|#{1,3}\s+.+)/i;
+  /^(제\s*\d+\s*[장화편]|\d+\s*화|#\d+(?:\s*화)?(?=$|[\s.,:)\]-])|CHAPTER\s+\d+|\d+\.\s+.+|#{1,3}\s+.+|〈\s*\d+(?:\.\s*[^〉]+|\s*화(?:\s+[^〉]+)?)\s*〉$|<\s*\d+(?:\.\s*[^>]+|\s*화(?:\s+[^>]+)?)\s*>$)/i;
+
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function escapeCharClass(str: string): string {
+  return str.replace(/[\\\]^-]/g, "\\$&");
+}
+
+/**
+ * Compiles a user-defined TOC pattern rule (`prefix` + number + `suffix` + optional `closing`)
+ * into a safe RegExp. Returns `null` when disabled or completely empty.
+ */
+export function compileTxtTocRule(rule: TxtTocPatternRule): RegExp | null {
+  if (!rule || !rule.enabled) return null;
+  const prefix = (rule.prefix || "").trim();
+  const rawSuffix = rule.suffix || "";
+  const suffix = rawSuffix.trim();
+  const isWhitespaceSuffix = rawSuffix.length > 0 && suffix.length === 0;
+  const closing = (rule.closing || "").trim();
+
+  if (!prefix && !suffix && !isWhitespaceSuffix && !closing) {
+    return null;
+  }
+
+  const prefixPart = prefix ? `${escapeRegExp(prefix)}\\s*` : "";
+
+  if (closing) {
+    const escapedClosing = escapeRegExp(closing);
+    const bodyChar = closing.length === 1 ? `[^${escapeCharClass(closing)}]` : ".";
+    let afterNum = `(?:\\s+${bodyChar}+)?`;
+    if (isWhitespaceSuffix) {
+      afterNum = `\\s+${bodyChar}+`;
+    } else if (suffix) {
+      const isPunct = /^[.,:)\]-]+$/.test(suffix);
+      afterNum = isPunct
+        ? `\\s*${escapeRegExp(suffix)}(?:\\s*${bodyChar}*)?`
+        : `\\s*${escapeRegExp(suffix)}(?:\\s+${bodyChar}+)?`;
+    }
+    return new RegExp(`^${prefixPart}\\d+${afterNum}\\s*${escapedClosing}$`, "i");
+  }
+
+  if (isWhitespaceSuffix) {
+    return new RegExp(`^${prefixPart}\\d+\\s+.+`, "i");
+  }
+  if (suffix) {
+    const isPunct = /^[.,:)\]-]+$/.test(suffix);
+    if (isPunct) {
+      return new RegExp(`^${prefixPart}\\d+\\s*${escapeRegExp(suffix)}(?=$|\\s)`, "i");
+    }
+    return new RegExp(
+      `^${prefixPart}\\d+\\s*${escapeRegExp(suffix)}(?=$|[\\s.,:)\\]-])`,
+      "i"
+    );
+  }
+  return new RegExp(`^${prefixPart}\\d+(?=$|[\\s.,:)\\]-])`, "i");
+}
+
+/**
+ * Generates a human-readable matching example for the settings UI preview.
+ */
+export function formatTxtTocRuleExample(
+  rule: Pick<TxtTocPatternRule, "prefix" | "suffix" | "closing">
+): string {
+  const prefix = (rule.prefix || "").trim();
+  const rawSuffix = rule.suffix || "";
+  const suffix = rawSuffix.trim();
+  const isWhitespaceSuffix = rawSuffix.length > 0 && suffix.length === 0;
+  const closing = (rule.closing || "").trim();
+
+  const p = prefix ? `${prefix}${closing ? " " : ""}` : "";
+  const s = isWhitespaceSuffix ? " " : suffix;
+  const sep = s && !isWhitespaceSuffix ? " " : isWhitespaceSuffix ? "" : " ";
+  const c = closing ? ` ${closing}` : "";
+  return `${p}12${s}${sep}제목${c}`.replace(/\s{2,}/g, " ").trim();
+}
+
+function buildHeadingMatchers(customRules?: TxtTocPatternRule[]): RegExp[] {
+  const matchers: RegExp[] = [HEADING_REGEX];
+  if (customRules && customRules.length > 0) {
+    for (const rule of customRules) {
+      const compiled = compileTxtTocRule(rule);
+      if (compiled) matchers.push(compiled);
+    }
+  }
+  return matchers;
+}
+
+function isHeadingLine(trimmed: string, matchers: RegExp[]): boolean {
+  if (trimmed.length === 0 || trimmed.length > 60) return false;
+  for (let i = 0; i < matchers.length; i++) {
+    if (matchers[i].test(trimmed)) return true;
+  }
+  return false;
+}
 
 /**
  * Parses raw text into structured paragraphs with character offsets and automatic chapter detection.
  */
-export function parseTxtDocument(rawText: string): {
+export function parseTxtDocument(
+  rawText: string,
+  customRules?: TxtTocPatternRule[]
+): {
   paragraphs: TxtParagraph[];
   toc: TocItem[];
   totalLength: number;
@@ -103,6 +202,7 @@ export function parseTxtDocument(rawText: string): {
   const rawLines = normalized.split("\n");
   const paragraphs: TxtParagraph[] = [];
   const toc: TocItem[] = [];
+  const matchers = buildHeadingMatchers(customRules);
 
   let currentOffset = 0;
   for (let i = 0; i < rawLines.length; i++) {
@@ -110,8 +210,7 @@ export function parseTxtDocument(rawText: string): {
     const trimmed = line.trim();
     const startOffset = currentOffset;
     const endOffset = currentOffset + line.length;
-    const isHeading =
-      trimmed.length > 0 && trimmed.length <= 60 && HEADING_REGEX.test(trimmed);
+    const isHeading = isHeadingLine(trimmed, matchers);
 
     const paragraph: TxtParagraph = {
       index: i,
@@ -139,6 +238,38 @@ export function parseTxtDocument(rawText: string): {
     toc,
     totalLength: Math.max(1, currentOffset),
   };
+}
+
+/**
+ * Recomputes paragraph heading flags and TOC items in-place without re-decoding the raw text.
+ */
+export function recomputeTxtToc(
+  existingParagraphs: TxtParagraph[],
+  customRules?: TxtTocPatternRule[]
+): {
+  paragraphs: TxtParagraph[];
+  toc: TocItem[];
+} {
+  const matchers = buildHeadingMatchers(customRules);
+  const paragraphs: TxtParagraph[] = new Array(existingParagraphs.length);
+  const toc: TocItem[] = [];
+
+  for (let i = 0; i < existingParagraphs.length; i++) {
+    const p = existingParagraphs[i];
+    const trimmed = p.text.trim();
+    const isHeading = isHeadingLine(trimmed, matchers);
+    paragraphs[i] = p.isHeading === isHeading ? p : { ...p, isHeading };
+    if (isHeading) {
+      toc.push({
+        id: `txt-toc-${p.index}`,
+        label: trimmed.replace(/^#{1,3}\s+/, ""),
+        href: `offset:${p.startOffset}`,
+        level: 0,
+      });
+    }
+  }
+
+  return { paragraphs, toc };
 }
 
 /**

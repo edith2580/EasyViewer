@@ -10,6 +10,7 @@ import {
   paginateTxtDocument,
   parseOffsetLocator,
   parseTxtDocument,
+  recomputeTxtToc,
   searchTxtDocument,
   type TxtParagraph
 } from '@/engines/txt/txtEngine'
@@ -23,6 +24,7 @@ import {
 } from '@/engines/txt/txtMeasuredPagination'
 import type { BookmarkItem, SearchResultItem, TocItem } from '@/types'
 import ViewerSettingsPanel from '@/components/viewer/ViewerSettingsPanel.vue'
+import TxtTocPatternModal from '@/components/viewer/TxtTocPatternModal.vue'
 import ViewerSideDrawer, { type DrawerTab } from '@/components/viewer/ViewerSideDrawer.vue'
 import {
   ArrowLeft,
@@ -52,6 +54,7 @@ const toastMsg = ref('')
 const drawerOpen = ref(false)
 const drawerTab = ref<DrawerTab>('toc')
 const settingsOpen = ref(false)
+const tocPatternModalOpen = ref(false)
 
 // Top/bottom navigation bars overlay the document; a tap in the center toggles them.
 const menuVisible = ref(true)
@@ -387,7 +390,7 @@ async function loadDocument() {
     // TXT Document
     const decoded = detectAndDecodeText(buffer)
     txtEncoding.value = decoded.encoding
-    const parsed = parseTxtDocument(decoded.text)
+    const parsed = parseTxtDocument(decoded.text, settingsStore.settings.txtTocRules)
     txtParagraphs.value = parsed.paragraphs
     tocItems.value = parsed.toc
     txtTotalLength.value = parsed.totalLength
@@ -818,9 +821,10 @@ function handleKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') {
     drawerOpen.value = false
     settingsOpen.value = false
+    tocPatternModalOpen.value = false
     return
   }
-  if (drawerOpen.value || settingsOpen.value) return
+  if (drawerOpen.value || settingsOpen.value || tocPatternModalOpen.value) return
   if (e.altKey || e.ctrlKey || e.metaKey) return
 
   // Arrow keys follow the reading direction: up/down in vertical scroll mode, left/right in
@@ -890,6 +894,21 @@ watch(
       scheduleTxtLayoutUpdate(offset)
     }
   }
+)
+
+// React to TXT custom TOC rule changes without re-decoding the book
+watch(
+  () => settingsStore.settings.txtTocRules,
+  (rules) => {
+    if (currentBook.value?.format !== 'txt' || txtParagraphs.value.length === 0) return
+    const { paragraphs, toc } = recomputeTxtToc(txtParagraphs.value, rules)
+    txtParagraphs.value = paragraphs
+    tocItems.value = toc
+    const offset = parseOffsetLocator(currentLocator.value)
+    currentChapterTitle.value = findTxtChapterForOffset(offset)
+    scheduleTxtLayoutUpdate(offset)
+  },
+  { deep: true }
 )
 
 onMounted(() => {
@@ -1221,7 +1240,28 @@ onBeforeUnmount(() => {
     <!-- Viewer Settings Modal -->
     <ViewerSettingsPanel
       :open="settingsOpen"
+      :book-format="currentBook?.format"
+      :toc-count="tocItems.length"
       @close="settingsOpen = false"
+      @open-toc-patterns="
+        () => {
+          settingsOpen = false
+          tocPatternModalOpen = true
+        }
+      "
+    />
+
+    <!-- Dedicated TXT TOC Pattern Management Modal -->
+    <TxtTocPatternModal
+      :open="tocPatternModalOpen"
+      :toc-count="tocItems.length"
+      @close="tocPatternModalOpen = false"
+      @back="
+        () => {
+          tocPatternModalOpen = false
+          settingsOpen = true
+        }
+      "
     />
 
     <!-- Toast Notification -->

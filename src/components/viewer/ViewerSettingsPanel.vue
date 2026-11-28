@@ -1,6 +1,7 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import { useSettingsStore } from '@/stores/useSettingsStore'
-import type { FontFamilyOption, ThemeMode, ViewMode } from '@/types'
+import type { BookFormat, FontFamilyOption, ThemeMode, ViewMode } from '@/types'
 import {
   BookOpen,
   ScrollText,
@@ -10,18 +11,25 @@ import {
   RotateCcw,
   Minus,
   Plus,
-  X
+  X,
+  ListTree,
+  ChevronRight
 } from 'lucide-vue-next'
 
 defineProps<{
   open: boolean
+  bookFormat?: BookFormat
+  tocCount?: number
 }>()
 
 const emit = defineEmits<{
   (e: 'close'): void
+  (e: 'open-toc-patterns'): void
 }>()
 
 const settingsStore = useSettingsStore()
+
+const customTocRuleCount = computed(() => (settingsStore.settings.txtTocRules ?? []).length)
 
 const viewModes: Array<{ value: ViewMode; label: string }> = [
   { value: 'scroll', label: '세로 스크롤' },
@@ -243,6 +251,31 @@ const fonts: Array<{ value: FontFamilyOption; label: string; previewClass: strin
             class="w-full accent-indigo-600"
             @input="settingsStore.setPageMargin(Number(($event.target as HTMLInputElement).value))"
           />
+        </div>
+
+        <!-- 7. TXT 목차 패턴 추가 버튼 (별도 관리 화면으로 이동) -->
+        <div
+          v-if="bookFormat === 'txt'"
+          class="pt-4 border-t"
+          :style="{ borderColor: 'var(--ev-border)' }"
+        >
+          <button
+            type="button"
+            class="w-full flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-xl border text-left hover:border-indigo-500 transition-all"
+            :style="{ borderColor: 'var(--ev-border)' }"
+            @click="emit('open-toc-patterns')"
+          >
+            <span class="flex items-center gap-2 min-w-0">
+              <ListTree class="w-4 h-4 text-indigo-500 shrink-0" />
+              <span class="min-w-0">
+                <span class="block text-xs font-semibold">목차 패턴 추가</span>
+                <span class="block text-[11px] opacity-60">
+                  등록됨 {{ customTocRuleCount }}개<template v-if="typeof tocCount === 'number'"> · 인식된 목차 {{ tocCount }}개</template>
+                </span>
+              </span>
+            </span>
+            <ChevronRight class="w-4 h-4 opacity-50 shrink-0" />
+          </button>
         </div>
       </div>
     </div>

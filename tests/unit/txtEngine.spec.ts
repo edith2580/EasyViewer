@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
+  compileTxtTocRule,
   detectAndDecodeText,
+  formatTxtTocRuleExample,
   paginateTxtDocument,
   parseOffsetLocator,
   parseTxtDocument,
+  recomputeTxtToc,
   searchTxtDocument
 } from '@/engines/txt/txtEngine'
 
@@ -44,6 +47,51 @@ describe('txtEngine characterization', () => {
     ])
     expect(parsed.toc.every((t) => t.href.startsWith('offset:'))).toBe(true)
     expect(parsed.totalLength).toBeGreaterThan(sample.length)
+  })
+
+  it('parses angle-bracketed numeric/episode headings into TOC', () => {
+    const sample = [
+      '〈 76. 제목 〉',
+      '〈 76화 제목 〉',
+      '< 76. 제목 >',
+      '< 76화 제목 >',
+      '〈77화〉',
+      '<78. 공백없는제목>',
+      '〈 일반 괄호 문장 〉',
+      '<일반 태그>'
+    ].join('\n')
+    const parsed = parseTxtDocument(sample)
+
+    expect(parsed.toc.map((t) => t.label)).toEqual([
+      '〈 76. 제목 〉',
+      '〈 76화 제목 〉',
+      '< 76. 제목 >',
+      '< 76화 제목 >',
+      '〈77화〉',
+      '<78. 공백없는제목>'
+    ])
+  })
+
+  it('compiles user custom TOC pattern rules safely and recomputes TOC dynamically', () => {
+    const rules = [
+      { id: 'r1', prefix: '[', suffix: '부', closing: ']', enabled: true },
+      { id: 'r2', prefix: '', suffix: '회', closing: '', enabled: true },
+      { id: 'r3', prefix: '★', suffix: '.', closing: '', enabled: false }
+    ]
+
+    expect(compileTxtTocRule(rules[0])).not.toBeNull()
+    expect(compileTxtTocRule(rules[2])).toBeNull()
+    expect(formatTxtTocRuleExample(rules[0])).toBe('[ 12부 제목 ]')
+
+    const sample = '[ 1부 여명의 시작 ]\n일반 본문입니다.\n12회 결전\n★ 3. 비활성 규칙'
+    const base = parseTxtDocument(sample)
+    expect(base.toc).toHaveLength(0)
+
+    const updated = recomputeTxtToc(base.paragraphs, rules)
+    expect(updated.toc.map((t) => t.label)).toEqual(['[ 1부 여명의 시작 ]', '12회 결전'])
+    expect(updated.paragraphs[0].isHeading).toBe(true)
+    expect(updated.paragraphs[2].isHeading).toBe(true)
+    expect(updated.paragraphs[3].isHeading).toBe(false)
   })
 
   it('paginates with fallback estimator keeping percentages within 0..100', () => {

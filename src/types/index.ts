@@ -6,6 +6,14 @@ export type ThemeMode = 'light' | 'dark' | 'sepia'
 
 export type FontFamilyOption = 'sans' | 'serif' | 'mono' | 'system'
 
+export interface TxtTocPatternRule {
+  id: string
+  prefix: string
+  suffix: string
+  closing?: string
+  enabled: boolean
+}
+
 export interface ViewerSettings {
   viewMode: ViewMode
   theme: ThemeMode
@@ -15,6 +23,7 @@ export interface ViewerSettings {
   pageMargin: number // px (16 ~ 64)
   autoSync: boolean
   syncEndpoint: string
+  txtTocRules?: TxtTocPatternRule[]
 }
 
 export interface ReadingLocation {

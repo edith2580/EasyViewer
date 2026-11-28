@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, watch } from 'vue'
-import type { FontFamilyOption, ThemeMode, ViewerSettings, ViewMode } from '@/types'
+import type { FontFamilyOption, ThemeMode, TxtTocPatternRule, ViewerSettings, ViewMode } from '@/types'
 import { platformStorage } from '@/services/storage/platformAdapter'
 
 const SETTINGS_STORAGE_KEY = 'viewer_settings_v2'
@@ -13,11 +13,12 @@ const DEFAULT_SETTINGS: ViewerSettings = {
   lineHeight: 1.75,
   pageMargin: 32,
   autoSync: true,
-  syncEndpoint: ''
+  syncEndpoint: '',
+  txtTocRules: []
 }
 
 export const useSettingsStore = defineStore('settings', () => {
-  const settings = ref<ViewerSettings>({ ...DEFAULT_SETTINGS })
+  const settings = ref<ViewerSettings>({ ...DEFAULT_SETTINGS, txtTocRules: [] })
   const isLoaded = ref(false)
 
   async function initSettings() {
@@ -25,7 +26,8 @@ export const useSettingsStore = defineStore('settings', () => {
     const saved = await platformStorage.getItem<Partial<ViewerSettings>>(SETTINGS_STORAGE_KEY, {})
     settings.value = {
       ...DEFAULT_SETTINGS,
-      ...saved
+      ...saved,
+      txtTocRules: Array.isArray(saved.txtTocRules) ? saved.txtTocRules : []
     }
     applyGlobalThemeClass(settings.value.theme)
     isLoaded.value = true
@@ -107,8 +109,32 @@ export const useSettingsStore = defineStore('settings', () => {
     settings.value.pageMargin = Math.min(80, Math.max(12, margin))
   }
 
+  function addTxtTocRule(input: { prefix: string; suffix: string; closing?: string }) {
+    const list = settings.value.txtTocRules ?? []
+    const rule: TxtTocPatternRule = {
+      id: `toc-rule-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      prefix: input.prefix,
+      suffix: input.suffix,
+      closing: input.closing || '',
+      enabled: true
+    }
+    settings.value.txtTocRules = [...list, rule]
+  }
+
+  function toggleTxtTocRule(id: string) {
+    const list = settings.value.txtTocRules ?? []
+    settings.value.txtTocRules = list.map((r) =>
+      r.id === id ? { ...r, enabled: !r.enabled } : r
+    )
+  }
+
+  function removeTxtTocRule(id: string) {
+    const list = settings.value.txtTocRules ?? []
+    settings.value.txtTocRules = list.filter((r) => r.id !== id)
+  }
+
   function resetSettings() {
-    settings.value = { ...DEFAULT_SETTINGS }
+    settings.value = { ...DEFAULT_SETTINGS, txtTocRules: [] }
     applyGlobalThemeClass(settings.value.theme)
   }
 
@@ -119,7 +145,10 @@ export const useSettingsStore = defineStore('settings', () => {
       if (saveSettingsTimer) {
         clearTimeout(saveSettingsTimer)
       }
-      const snapshot = { ...newVal }
+      const snapshot: ViewerSettings = {
+        ...newVal,
+        txtTocRules: (newVal.txtTocRules ?? []).map((r) => ({ ...r }))
+      }
       saveSettingsTimer = setTimeout(() => {
         platformStorage.setItem(SETTINGS_STORAGE_KEY, snapshot)
       }, 250)
@@ -137,6 +166,9 @@ export const useSettingsStore = defineStore('settings', () => {
     setFontSize,
     setLineHeight,
     setPageMargin,
+    addTxtTocRule,
+    toggleTxtTocRule,
+    removeTxtTocRule,
     resetSettings
   }
 })
